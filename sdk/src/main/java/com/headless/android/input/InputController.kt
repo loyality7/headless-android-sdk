@@ -45,18 +45,23 @@ class InputController(
         run("keyevent", keyCode.toString())
     }
 
+    /**
+     * Runs one `input` subcommand and performs **execution-level** verification only:
+     * the command ran and reported no error. This says nothing about whether the UI
+     * reacted — state and semantic verification are the transaction engine's job, not
+     * this primitive's.
+     */
     private fun run(subCommand: String, vararg args: String) {
         val command = arrayOf("input", "-d", displayId.toString(), subCommand, *args)
-        val exitCode = try {
-            privilegeBackend.runShellCommand(command)
+        val result = try {
+            privilegeBackend.shell(command)
         } catch (e: Throwable) {
             HeadlessLog.event(displayId = displayId, op = "$OP.$subCommand", success = false)
             throw InputInjectionException("Failed to run input $subCommand", e)
         }
-        val success = exitCode == 0
-        HeadlessLog.event(displayId = displayId, op = "$OP.$subCommand", success = success)
-        if (!success) {
-            throw InputInjectionException("input $subCommand exited with code $exitCode")
+        HeadlessLog.event(displayId = displayId, op = "$OP.$subCommand", success = result.isSuccess)
+        if (!result.isSuccess) {
+            throw InputInjectionException("input $subCommand failed: ${result.summary()}")
         }
     }
 }

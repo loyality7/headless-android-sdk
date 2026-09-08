@@ -55,8 +55,10 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
             throw AppLaunchException(packageName, "startActivity transaction failed: ${e.message}", e)
         }
 
+        var lastSeenOn: Set<Int> = emptySet()
         repeat(VERIFY_ATTEMPTS) {
-            if (isRunningOnDisplay(packageName, displayId)) {
+            lastSeenOn = displayIdsHosting(packageName)
+            if (lastSeenOn.contains(displayId)) {
                 HeadlessLog.event(displayId = displayId, packageName = packageName, op = OP, success = true)
                 return
             }
@@ -64,11 +66,20 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
         }
 
         HeadlessLog.event(displayId = displayId, packageName = packageName, op = OP, success = false)
-        throw AppLaunchException(
-            packageName,
-            "Launched but never observed resumed on display $displayId within " +
-                "${VERIFY_ATTEMPTS * VERIFY_DELAY_MS}ms"
-        )
+
+        // Distinguish "didn't start" from "started on the WRONG display". The latter is a
+        // safety-critical case: the app may be on the user's physical display, where any
+        // subsequent input injection would hit the real screen.
+        val elsewhere = lastSeenOn - displayId
+        val detail = when {
+            elsewhere.isEmpty() ->
+                "not observed on any display within ${VERIFY_ATTEMPTS * VERIFY_DELAY_MS}ms"
+            else ->
+                "PLACED ON THE WRONG DISPLAY(S) ${elsewhere.sorted()} instead of $displayId — " +
+                    "the platform redirected this app (display 0 = the user's physical screen). " +
+                    "Refusing to report success; do not inject input for this session."
+        }
+        throw AppLaunchException(packageName, detail)
     }
 
     private fun resolveClassName(component: String): String {
@@ -78,9 +89,9 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
     }
 
     private fun resolveMainComponent(packageName: String): String? {
-        val output = privilegeBackend.captureShellOutput(
+        val output = privilegeBackend.shell(
             arrayOf("cmd", "package", "resolve-activity", "--brief", packageName)
-        )
+        ).stdout
         val lastLine = output.lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() }
             ?: return null
         return if (lastLine.contains("/")) lastLine else null
@@ -115,8 +126,20 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
         }
     }
 
-    private fun isRunningOnDisplay(packageName: String, displayId: Int): Boolean {
-        val output = privilegeBackend.captureShellOutput(arrayOf("dumpsys", "activity", "activities"))
+    /** Force-stops [packageName]. Returns true if the stop command completed cleanly. */
+    fun stop(packageName: String): Boolean {
+        val result = privilegeBackend.shell(arrayOf("am", "force-stop", packageName))
+        HeadlessLog.event(packageName = packageName, op = "$OP.stop", success = result.isSuccess)
+        return result.isSuccess
+    }
+
+    /**
+     * Returns the package name of the top resumed activity on [displayId], or null if that
+     * display has no resumed activity. Used for state-level verification — "which app is
+     * actually in front on our display right now".
+     */
+    fun currentPackageOnDisplay(displayId: Int): String? {
+        val output = privilegeBackend.shell(arrayOf("dumpsys", "activity", "activities")).stdout
         var currentDisplayId = -1
         for (rawLine in output.lineSequence()) {
             val line = rawLine.trim()
@@ -124,10 +147,63 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
                 currentDisplayId = line.substringAfter("Display #")
                     .substringBefore(" ").substringBefore("(").trim().toIntOrNull() ?: currentDisplayId
             }
-            if (currentDisplayId == displayId && line.contains(packageName) && line.contains("Task{")) {
-                return true
+            if (currentDisplayId == displayId && line.startsWith("ResumedActivity:")) {
+                // e.g. "ResumedActivity: ActivityRecord{hash u0 com.pkg/.Activity t123}"
+                val record = line.substringAfter("ActivityRecord{", "").trim()
+                if (record.isEmpty()) continue
+                val componentToken = record.split(" ").firstOrNull { it.contains("/") } ?: continue
+                return componentToken.substringBefore("/")
             }
         }
-        return false
+        return null
+    }
+
+    /** True if [packageName] has a task on [displayId]. */
+    fun isOnDisplay(packageName: String, displayId: Int): Boolean =
+        displayIdsHosting(packageName).contains(displayId)
+
+    /**
+     * Every display ID that currently hosts a task for [packageName].
+     *
+     * Returning the full set rather than a boolean is deliberate: knowing the app is on
+     * *some other* display is the difference between "launch pending" and "the platform
+     * put this app on the user's physical screen", and callers must be able to tell those
+     * apart. A boolean check hid exactly that case and caused input to be injected while
+     * the target app was actually on display 0.
+     */
+    fun displayIdsHosting(packageName: String): Set<Int> {
+        val output = privilegeBackend.shell(arrayOf("dumpsys", "activity", "activities")).stdout
+        val hosting = mutableSetOf<Int>()
+        var section = -1
+
+        for (rawLine in output.lineSequence()) {
+            val header = parseDisplaySectionHeader(rawLine)
+            if (header != null) {
+                section = header
+                continue
+            }
+            if (section >= 0 && rawLine.contains(packageName) && rawLine.contains("Task{")) {
+                hosting.add(section)
+            }
+        }
+        return hosting
+    }
+
+    /**
+     * Parses a `dumpsys activity activities` display *section header*, e.g.
+     * `Display #159 (activities from top to bottom):`
+     *
+     * Must match only true section headers. The previous implementation used
+     * `line.contains("Display #")`, which also matched incidental references to
+     * "Display #0" inside task/activity detail lines; that silently reassigned the
+     * current-section id mid-section, so a display-0 task could be attributed to the
+     * target display and a launch verified as successful when the app was never there.
+     */
+    private fun parseDisplaySectionHeader(rawLine: String): Int? {
+        val line = rawLine.trimEnd()
+        // Section headers start at column 0 (no leading whitespace) in AMS output.
+        if (line != rawLine.trimStart()) return null
+        val match = Regex("""^Display #(\d+)\b""").find(line) ?: return null
+        return match.groupValues[1].toIntOrNull()
     }
 }

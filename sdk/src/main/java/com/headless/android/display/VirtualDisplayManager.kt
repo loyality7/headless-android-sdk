@@ -29,6 +29,23 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
         private const val INTERFACE_TOKEN = "android.hardware.display.IDisplayManager"
         private const val TRANSACTION_CREATE_VIRTUAL_DISPLAY = 21
         private const val CALLING_PACKAGE = "com.android.shell"
+
+        /**
+         * `IDisplayManager.releaseVirtualDisplay(IVirtualDisplayCallback token)`.
+         *
+         * Per AOSP `core/java/android/hardware/display/IDisplayManager.aidl`, the virtual
+         * display methods are declared in this order:
+         *   createVirtualDisplay        (verified on-device = 21)
+         *   resizeVirtualDisplay        (= 22)
+         *   setVirtualDisplaySurface    (= 23)
+         *   releaseVirtualDisplay       (= 24)
+         *
+         * AIDL assigns transaction codes sequentially in declaration order, so release is
+         * create+3. This is derived rather than guessed, but it is still build-dependent:
+         * [releaseDisplay] therefore verifies the display actually disappeared and reports
+         * failure loudly instead of assuming the transaction worked.
+         */
+        private const val TRANSACTION_RELEASE_VIRTUAL_DISPLAY = TRANSACTION_CREATE_VIRTUAL_DISPLAY + 3
     }
 
     fun createTrustedDisplay(
@@ -48,14 +65,24 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
                 .setSurface(imageReader.surface)
                 .build()
 
-            val displayId = transactCreateVirtualDisplay(displayBinder, config)
+            // The callback token identifies this display for release; it must outlive the call.
+            val callbackToken = newVirtualDisplayCallbackToken()
+            val displayId = transactCreateVirtualDisplay(displayBinder, config, callbackToken)
 
             if (displayId < 0) {
                 throw DisplayCreationException("createVirtualDisplay returned invalid id=$displayId")
             }
 
             HeadlessLog.event(displayId = displayId, op = OP, success = true)
-            return HeadlessDisplay(displayId, width, height, densityDpi, imageReader, virtualDisplay = null)
+            return HeadlessDisplay(
+                displayId = displayId,
+                width = width,
+                height = height,
+                densityDpi = densityDpi,
+                imageReader = imageReader,
+                callbackToken = callbackToken,
+                releaser = { token -> releaseDisplay(displayId, token) }
+            )
         } catch (e: DisplayCreationException) {
             imageReader.close()
             throw e
@@ -66,20 +93,27 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
         }
     }
 
-    private fun transactCreateVirtualDisplay(displayBinder: android.os.IBinder, config: VirtualDisplayConfig): Int {
+    /**
+     * Minimal `IVirtualDisplayCallback` stub. We don't need lifecycle callbacks, but the
+     * binder itself is the display's identity for release, so the caller retains it.
+     */
+    private fun newVirtualDisplayCallbackToken(): android.os.IBinder =
+        object : android.os.Binder(), android.os.IInterface {
+            init { attachInterface(this, "android.hardware.display.IVirtualDisplayCallback") }
+            override fun asBinder(): android.os.IBinder = this
+        }
+
+    private fun transactCreateVirtualDisplay(
+        displayBinder: android.os.IBinder,
+        config: VirtualDisplayConfig,
+        callbackToken: android.os.IBinder
+    ): Int {
         val data = Parcel.obtain()
         val reply = Parcel.obtain()
         try {
             data.writeInterfaceToken(INTERFACE_TOKEN)
             data.writeTypedObject(config, 0)
-
-            // Minimal IVirtualDisplayCallback stub — we don't need lifecycle callbacks,
-            // just a valid binder for the transaction to accept.
-            val callbackBinder = object : android.os.Binder(), android.os.IInterface {
-                init { attachInterface(this, "android.hardware.display.IVirtualDisplayCallback") }
-                override fun asBinder(): android.os.IBinder = this
-            }
-            data.writeStrongBinder(callbackBinder)
+            data.writeStrongBinder(callbackToken)
             data.writeStrongBinder(null) // IMediaProjection
             data.writeString(CALLING_PACKAGE)
 
@@ -89,6 +123,50 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
         } finally {
             data.recycle()
             reply.recycle()
+        }
+    }
+
+    /**
+     * Destroys the virtual display identified by [callbackToken], then verifies it is
+     * actually gone. Verification matters because the transaction code is derived from
+     * AIDL declaration order rather than a published constant — if a build reorders the
+     * interface, a wrong code could "succeed" without releasing anything, which is exactly
+     * the silent-leak failure this method exists to prevent.
+     */
+    fun releaseDisplay(displayId: Int, callbackToken: android.os.IBinder) {
+        val displayBinder = privilegeBackend.getSystemServiceBinder("display")
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        try {
+            data.writeInterfaceToken(INTERFACE_TOKEN)
+            data.writeStrongBinder(callbackToken)
+            displayBinder.transact(TRANSACTION_RELEASE_VIRTUAL_DISPLAY, data, reply, 0)
+            reply.readException()
+        } catch (e: Throwable) {
+            HeadlessLog.event(displayId = displayId, op = "$OP.release", success = false)
+            throw DisplayCreationException("releaseVirtualDisplay($displayId) failed: ${e.message}", e)
+        } finally {
+            data.recycle()
+            reply.recycle()
+        }
+
+        val stillPresent = displayStillExists(displayId)
+        HeadlessLog.event(displayId = displayId, op = "$OP.release", success = !stillPresent)
+        if (stillPresent) {
+            throw DisplayCreationException(
+                "releaseVirtualDisplay($displayId) reported success but display is still " +
+                    "registered with DisplayManagerService — display leaked"
+            )
+        }
+    }
+
+    private fun displayStillExists(displayId: Int): Boolean {
+        return try {
+            privilegeBackend.shell(arrayOf("dumpsys", "display")).stdout
+                .contains("mDisplayId=$displayId")
+        } catch (e: Throwable) {
+            HeadlessLog.w(OP, "post-release verification query failed for display $displayId", e)
+            false // don't turn a verification outage into a spurious leak error
         }
     }
 }

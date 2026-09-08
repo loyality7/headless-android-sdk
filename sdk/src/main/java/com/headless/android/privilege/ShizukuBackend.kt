@@ -12,7 +12,7 @@ import kotlin.coroutines.resume
 
 /**
  * [PrivilegeBackend] backed by Shizuku (shell UID 2000). This is the only
- * class in the SDK allowed to reference `rikka.shizuku.*` directly.
+ * class in the runtime allowed to reference `rikka.shizuku.*` directly.
  */
 class ShizukuBackend : PrivilegeBackend {
 
@@ -20,6 +20,8 @@ class ShizukuBackend : PrivilegeBackend {
         private const val OP = "ShizukuBackend"
         private const val REQUEST_CODE = 8341 // arbitrary, scoped to this backend
     }
+
+    override val name: String = "shizuku"
 
     override fun isAvailable(): Boolean {
         return try {
@@ -30,6 +32,30 @@ class ShizukuBackend : PrivilegeBackend {
         }
     }
 
+    /**
+     * Waits up to [timeoutMs] for Shizuku's binder to arrive, then reports availability.
+     *
+     * Shizuku delivers its binder asynchronously through its ContentProvider after process
+     * start, so an immediate [isAvailable] check in a cold-started component returns false
+     * even when the Shizuku server is running fine. Observed failure: a freshly started
+     * foreground service reported "Shizuku is not running or not reachable" while
+     * `shizuku_server` was demonstrably alive. Callers that run early must wait rather
+     * than conclude the backend is missing.
+     */
+    fun awaitAvailable(timeoutMs: Long = 5_000L, pollIntervalMs: Long = 150L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (isAvailable()) return true
+            try {
+                Thread.sleep(pollIntervalMs)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return isAvailable()
+            }
+        }
+        return isAvailable()
+    }
+
     override fun isAuthorized(): Boolean {
         if (!isAvailable()) return false
         return try {
@@ -37,6 +63,32 @@ class ShizukuBackend : PrivilegeBackend {
         } catch (e: Throwable) {
             false
         }
+    }
+
+    override fun isAlive(): Boolean = isAvailable() && isAuthorized()
+
+    override fun capabilities(): Set<BackendCapability> = setOf(
+        BackendCapability.TRUSTED_DISPLAY,
+        BackendCapability.CROSS_DISPLAY_LAUNCH,
+        BackendCapability.INPUT_INJECTION,
+        BackendCapability.SHELL,
+        BackendCapability.SYSTEM_SERVICE_BINDER
+    )
+
+    override fun info(): BackendInfo {
+        var uid: Int? = null
+        var selinux: String? = null
+        var version: String? = null
+        try {
+            if (isAvailable()) {
+                uid = Shizuku.getUid()
+                selinux = Shizuku.getSELinuxContext()
+                version = Shizuku.getVersion().toString()
+            }
+        } catch (e: Throwable) {
+            HeadlessLog.d(OP, "info() partially unavailable: ${e.message}")
+        }
+        return BackendInfo(name = name, uid = uid, selinuxContext = selinux, version = version)
     }
 
     override suspend fun requestAuthorization(): Boolean {
@@ -66,16 +118,14 @@ class ShizukuBackend : PrivilegeBackend {
         return ShizukuBinderWrapper(raw)
     }
 
-    override fun runShellCommand(command: Array<String>): Int {
-        return startProcess(command).waitFor()
-    }
-
-    override fun captureShellOutput(command: Array<String>): String {
+    override fun shell(command: Array<String>): ShellResult {
         val process = startProcess(command)
+        // Read both streams before waiting: a command that fills a pipe buffer while we
+        // block in waitFor() would deadlock.
         val stdout = process.inputStream.bufferedReader().readText()
         val stderr = process.errorStream.bufferedReader().readText()
-        process.waitFor()
-        return if (stderr.isBlank()) stdout else "$stdout\n$stderr"
+        val exit = process.waitFor()
+        return ShellResult(exitCode = exit, stdout = stdout, stderr = stderr)
     }
 
     private fun startProcess(command: Array<String>): Process {
