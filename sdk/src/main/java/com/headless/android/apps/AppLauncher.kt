@@ -7,6 +7,7 @@ import android.os.Parcel
 import com.headless.android.AppLaunchException
 import com.headless.android.HeadlessLog
 import com.headless.android.privilege.PrivilegeBackend
+import com.headless.android.state.ActivityDumpParser
 
 /**
  * Launches an Android application's default activity onto a specific (virtual) display,
@@ -134,31 +135,18 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
     }
 
     /**
-     * Returns the package name of the top resumed activity on [displayId], or null if that
-     * display has no resumed activity. Used for state-level verification — "which app is
-     * actually in front on our display right now".
+     * Package name of the top resumed activity on [displayId], or null.
+     *
+     * Delegates to [ActivityDumpParser] — the single tested parser. Three separate
+     * hand-rolled variants of this logic previously produced wrong answers (see that
+     * class's docs), so there must be exactly one implementation.
      */
     fun currentPackageOnDisplay(displayId: Int): String? {
         val output = privilegeBackend.shell(arrayOf("dumpsys", "activity", "activities")).stdout
-        var currentDisplayId = -1
-        for (rawLine in output.lineSequence()) {
-            val line = rawLine.trim()
-            if (line.contains("Display #")) {
-                currentDisplayId = line.substringAfter("Display #")
-                    .substringBefore(" ").substringBefore("(").trim().toIntOrNull() ?: currentDisplayId
-            }
-            if (currentDisplayId == displayId && line.startsWith("ResumedActivity:")) {
-                // e.g. "ResumedActivity: ActivityRecord{hash u0 com.pkg/.Activity t123}"
-                val record = line.substringAfter("ActivityRecord{", "").trim()
-                if (record.isEmpty()) continue
-                val componentToken = record.split(" ").firstOrNull { it.contains("/") } ?: continue
-                return componentToken.substringBefore("/")
-            }
-        }
-        return null
+        return ActivityDumpParser.foregroundPackageOnDisplay(output, displayId)
     }
 
-    /** True if [packageName] has a task on [displayId]. */
+    /** True if [packageName] currently has a task on [displayId]. */
     fun isOnDisplay(packageName: String, displayId: Int): Boolean =
         displayIdsHosting(packageName).contains(displayId)
 
@@ -168,42 +156,10 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
      * Returning the full set rather than a boolean is deliberate: knowing the app is on
      * *some other* display is the difference between "launch pending" and "the platform
      * put this app on the user's physical screen", and callers must be able to tell those
-     * apart. A boolean check hid exactly that case and caused input to be injected while
-     * the target app was actually on display 0.
+     * apart. A boolean check hid exactly that case.
      */
     fun displayIdsHosting(packageName: String): Set<Int> {
         val output = privilegeBackend.shell(arrayOf("dumpsys", "activity", "activities")).stdout
-        val hosting = mutableSetOf<Int>()
-        var section = -1
-
-        for (rawLine in output.lineSequence()) {
-            val header = parseDisplaySectionHeader(rawLine)
-            if (header != null) {
-                section = header
-                continue
-            }
-            if (section >= 0 && rawLine.contains(packageName) && rawLine.contains("Task{")) {
-                hosting.add(section)
-            }
-        }
-        return hosting
-    }
-
-    /**
-     * Parses a `dumpsys activity activities` display *section header*, e.g.
-     * `Display #159 (activities from top to bottom):`
-     *
-     * Must match only true section headers. The previous implementation used
-     * `line.contains("Display #")`, which also matched incidental references to
-     * "Display #0" inside task/activity detail lines; that silently reassigned the
-     * current-section id mid-section, so a display-0 task could be attributed to the
-     * target display and a launch verified as successful when the app was never there.
-     */
-    private fun parseDisplaySectionHeader(rawLine: String): Int? {
-        val line = rawLine.trimEnd()
-        // Section headers start at column 0 (no leading whitespace) in AMS output.
-        if (line != rawLine.trimStart()) return null
-        val match = Regex("""^Display #(\d+)\b""").find(line) ?: return null
-        return match.groupValues[1].toIntOrNull()
+        return ActivityDumpParser.displayIdsHosting(output, packageName)
     }
 }

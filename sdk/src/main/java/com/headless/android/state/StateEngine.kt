@@ -59,8 +59,11 @@ class StateEngine(private val privilegeBackend: PrivilegeBackend) {
 
     /**
      * Package name of the top resumed activity on [displayId], or null.
-     * Independent of [com.headless.android.apps.AppLauncher]'s own launch verification
-     * on purpose — verification must not consult the same code that performed the action.
+     *
+     * Delegates to [ActivityDumpParser]. Independent of [com.headless.android.apps.AppLauncher]'s
+     * launch verification on purpose — verification must not consult the same code that
+     * performed the action — but both share the one tested parser rather than each
+     * hand-rolling their own.
      */
     fun currentPackageOnDisplay(displayId: Int): String? {
         val out = try {
@@ -69,21 +72,7 @@ class StateEngine(private val privilegeBackend: PrivilegeBackend) {
             HeadlessLog.w(OP, "currentPackageOnDisplay query failed for display $displayId", e)
             return null
         }
-        var currentDisplayId = -1
-        for (rawLine in out.lineSequence()) {
-            val line = rawLine.trim()
-            if (line.contains("Display #")) {
-                currentDisplayId = line.substringAfter("Display #")
-                    .substringBefore(" ").substringBefore("(").trim().toIntOrNull() ?: currentDisplayId
-            }
-            if (currentDisplayId == displayId && line.startsWith("ResumedActivity:")) {
-                val record = line.substringAfter("ActivityRecord{", "").trim()
-                if (record.isEmpty()) continue
-                val token = record.split(" ").firstOrNull { it.contains("/") } ?: continue
-                return token.substringBefore("/")
-            }
-        }
-        return null
+        return ActivityDumpParser.foregroundPackageOnDisplay(out, displayId)
     }
 
     fun sessionState(sessionId: String, displayId: Int, sessionOpen: Boolean): SessionState {
