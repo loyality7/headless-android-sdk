@@ -139,6 +139,9 @@ class ControlService : Service() {
         "observe", "screenshot" -> AutomationCommand.Observe
         "enter", "pressenter" -> AutomationCommand.PressEnter
         "back", "pressback" -> AutomationCommand.PressBack
+        "tab", "presstab" -> AutomationCommand.PressTab
+        "clear", "cleartext" -> AutomationCommand.ClearText
+        "delete", "deletetext" -> AutomationCommand.DeleteText(intent.getIntExtra("count", 1))
         "launch" -> intent.getStringExtra("pkg")?.let { AutomationCommand.LaunchApp(it) }
         "stop" -> intent.getStringExtra("pkg")?.let { AutomationCommand.StopApp(it) }
         "type" -> intent.getStringExtra("text")?.let { AutomationCommand.TypeText(it) }

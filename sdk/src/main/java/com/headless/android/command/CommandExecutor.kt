@@ -5,6 +5,8 @@ import com.headless.android.HeadlessRuntime
 import com.headless.android.HeadlessSession
 import com.headless.android.capture.Screenshot
 import com.headless.android.observation.FrameDiff
+import com.headless.android.observation.WaitOutcome
+import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.FileOutputStream
 
@@ -25,7 +27,11 @@ class CommandExecutor(
     private val outputDir: File,
     /** Pixel-change ratio above which the screen is considered to have actually changed. */
     private val changeThreshold: Float = 0.005f,
-    /** Settle time after an action before observing its effect. */
+    /** Max wait for an action to produce any visible change before giving up on it. */
+    private val changeTimeoutMs: Long = 3_000L,
+    /** Max wait for the screen to settle after it started changing. */
+    private val stableTimeoutMs: Long = 5_000L,
+    /** Settle time used where a condition wait does not apply (launch/stop/session ops). */
     private val postActionDelayMs: Long = 1200L
 ) {
     private companion object {
@@ -52,6 +58,9 @@ class CommandExecutor(
                 is AutomationCommand.TypeText -> act(command, start) { it.type(command.text) }
                 AutomationCommand.PressEnter -> act(command, start) { it.pressEnter() }
                 AutomationCommand.PressBack -> act(command, start) { it.pressBack() }
+                AutomationCommand.PressTab -> act(command, start) { it.pressTab() }
+                is AutomationCommand.DeleteText -> act(command, start) { it.deleteText(command.count) }
+                AutomationCommand.ClearText -> act(command, start) { it.clearText() }
             }
         } catch (e: Throwable) {
             HeadlessLog.e(OP, "command $command threw", e)
@@ -193,10 +202,31 @@ class CommandExecutor(
 
         action(s) // throws InputInjectionException on execution-level failure
 
-        Thread.sleep(postActionDelayMs)
+        // Wait on an actual condition instead of sleeping a fixed interval. A fixed sleep
+        // is wrong in both directions: the audit measured legitimate UI reactions arriving
+        // anywhere from ~1.3s to ~2.4s, so a short sleep judges the action too early while
+        // a long one makes every action pay worst-case cost. Waiting for "changed, then
+        // settled" returns as soon as the UI is actually done reacting, and reports
+        // honestly when nothing ever happened.
+        val waitOutcome = runBlocking {
+            s.waitForChangeThenStable(
+                changeTimeoutMs = changeTimeoutMs,
+                stableTimeoutMs = stableTimeoutMs
+            )
+        }
+
         val after = captureQuietly(s)
         val pkgAfter = s.currentApp()
         lastFrame = after
+        HeadlessLog.d(
+            OP,
+            "post-action wait: met=${waitOutcome.met} waited=${
+                when (waitOutcome) {
+                    is WaitOutcome.Met -> waitOutcome.waitedMillis
+                    is WaitOutcome.TimedOut -> waitOutcome.waitedMillis
+                }
+            }ms"
+        )
 
         val ratio = if (before != null && after != null) {
             FrameDiff.compare(before.bitmap, after.bitmap).changeRatio

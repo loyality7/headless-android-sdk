@@ -33,9 +33,25 @@ sealed interface AutomationCommand {
 
     data class TypeText(val text: String) : AutomationCommand
 
+    /**
+     * Deletes [count] characters backwards from the cursor.
+     *
+     * Added because a real task (composing a Gmail message) became unrecoverable without
+     * it: text typed into the wrong field could not be removed, so the runtime could
+     * neither complete nor cleanly abandon the task. An automation runtime that can only
+     * add text and never remove it cannot correct its own mistakes.
+     */
+    data class DeleteText(val count: Int) : AutomationCommand
+
+    /** Clears the focused field by selecting all and deleting. */
+    data object ClearText : AutomationCommand
+
     data object PressEnter : AutomationCommand
 
     data object PressBack : AutomationCommand
+
+    /** Moves focus to the next focusable field (Tab), for form traversal without coordinates. */
+    data object PressTab : AutomationCommand
 
     /** Capture the current frame and report state. */
     data object Observe : AutomationCommand

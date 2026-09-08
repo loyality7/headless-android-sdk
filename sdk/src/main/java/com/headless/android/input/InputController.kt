@@ -17,6 +17,8 @@ class InputController(
         private const val OP = "InputController"
         private const val KEYCODE_ENTER = 66
         private const val KEYCODE_BACK = 4
+        private const val KEYCODE_DEL = 67
+        private const val KEYCODE_TAB = 61
     }
 
     fun tap(x: Float, y: Float) {
@@ -40,6 +42,33 @@ class InputController(
     fun pressEnter() = pressKey(KEYCODE_ENTER)
 
     fun pressBack() = pressKey(KEYCODE_BACK)
+
+    fun pressTab() = pressKey(KEYCODE_TAB)
+
+    /**
+     * Deletes [count] characters backwards from the cursor.
+     *
+     * Sent as repeated DEL keyevents in a single `input` invocation where possible, since
+     * one shell round-trip per character is prohibitively slow (each measured ~1.3-2.5s
+     * end to end in the audit).
+     */
+    fun deleteText(count: Int) {
+        require(count > 0) { "count must be > 0" }
+        val args = Array(count) { KEYCODE_DEL.toString() }
+        run("keyevent", *args)
+    }
+
+    /**
+     * Clears the focused field: select-all, then delete.
+     *
+     * Uses CTRL+A rather than a long-press/menu flow because it needs no coordinates and
+     * no assumptions about the app's selection UI.
+     */
+    fun clearText() {
+        // KEYCODE_A (29) with the CTRL meta state (4096) = select all.
+        run("keycombination", "113", "29") // KEYCODE_CTRL_LEFT + KEYCODE_A
+        pressKey(KEYCODE_DEL)
+    }
 
     private fun pressKey(keyCode: Int) {
         run("keyevent", keyCode.toString())

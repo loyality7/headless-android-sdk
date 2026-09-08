@@ -4,8 +4,16 @@ import com.headless.android.apps.AppLauncher
 import com.headless.android.capture.FrameCapture
 import com.headless.android.capture.Screenshot
 import com.headless.android.display.HeadlessDisplay
+import com.headless.android.display.ImeIsolation
 import com.headless.android.display.VirtualDisplayManager
 import com.headless.android.input.InputController
+import com.headless.android.observation.Condition
+import com.headless.android.observation.FrameStream
+import com.headless.android.observation.ScreenFrame
+import com.headless.android.observation.StabilityPolicy
+import com.headless.android.observation.WaitEngine
+import com.headless.android.observation.WaitOutcome
+import kotlinx.coroutines.flow.Flow
 import com.headless.android.privilege.PrivilegeBackend
 import com.headless.android.state.SessionState
 import com.headless.android.state.StateEngine
@@ -38,6 +46,16 @@ class HeadlessSession internal constructor(
     private val inputController = InputController(privilegeBackend, display.displayId)
     private val frameCapture = FrameCapture(display.imageReader, display.displayId)
     private val stateEngine = StateEngine(privilegeBackend)
+
+    /**
+     * Attempt to prevent this display from ever showing a soft keyboard.
+     *
+     * Runs at construction, before any app can take text focus. The default secondary-display
+     * policy (FALLBACK_DISPLAY) puts the keyboard on the USER'S physical display, which was
+     * observed happening during automation and is a hard isolation violation.
+     */
+    val imeIsolation: ImeIsolation.Report =
+        ImeIsolation(privilegeBackend).isolate(display.displayId)
 
     /** Package launched through this session, tracked so [close] can stop it. */
     @Volatile
@@ -140,9 +158,86 @@ class HeadlessSession internal constructor(
         inputController.pressBack()
     }
 
+    fun pressTab() {
+        checkInputAllowed("pressTab")
+        inputController.pressTab()
+    }
+
+    /** Deletes [count] characters backwards from the cursor. */
+    fun deleteText(count: Int) {
+        checkInputAllowed("deleteText")
+        inputController.deleteText(count)
+    }
+
+    /** Clears the focused field (select-all then delete). */
+    fun clearText() {
+        checkInputAllowed("clearText")
+        inputController.clearText()
+    }
+
     fun screenshot(): Screenshot {
         checkOpen()
         return frameCapture.capture()
+    }
+
+    // ── Observation ────────────────────────────────────────────────────────────
+
+    /**
+     * Continuous annotated frame stream for this display: each frame carries its pixel
+     * change ratio versus the previous frame and whether the screen has settled.
+     *
+     * Cold and collector-driven — nothing is captured until collected, and capture stops
+     * when collection stops. Each frame holds a bitmap, so don't retain them.
+     */
+    fun frames(policy: StabilityPolicy = StabilityPolicy.DEFAULT, intervalMs: Long = 100L): Flow<ScreenFrame> {
+        checkOpen()
+        return FrameStream(frameCapture, policy, intervalMs).frames()
+    }
+
+    /**
+     * Waits until [condition] holds, or the deadline passes.
+     *
+     * Prefer this over sleeping: it returns as soon as the condition is true, and a
+     * timeout comes back as reportable evidence rather than silently proceeding on a
+     * guess. Timeouts are outcomes, not exceptions.
+     */
+    suspend fun waitUntil(
+        condition: Condition,
+        timeoutMs: Long = 5_000L,
+        description: String = "condition",
+        policy: StabilityPolicy = StabilityPolicy.DEFAULT
+    ): WaitOutcome {
+        checkOpen()
+        return WaitEngine(FrameStream(frameCapture, policy)).waitUntil(condition, timeoutMs, description)
+    }
+
+    /** Waits for the screen to stop changing. May legitimately time out on animated screens. */
+    suspend fun waitForStable(
+        timeoutMs: Long = 5_000L,
+        policy: StabilityPolicy = StabilityPolicy.DEFAULT
+    ): WaitOutcome {
+        checkOpen()
+        return WaitEngine(FrameStream(frameCapture, policy)).waitForStable(timeoutMs)
+    }
+
+    /** Waits for any pixel change beyond the policy threshold. */
+    suspend fun waitForChange(
+        timeoutMs: Long = 3_000L,
+        policy: StabilityPolicy = StabilityPolicy.DEFAULT
+    ): WaitOutcome {
+        checkOpen()
+        return WaitEngine(FrameStream(frameCapture, policy)).waitForChange(timeoutMs)
+    }
+
+    /** Waits for a change, then for the screen to settle — the usual post-action shape. */
+    suspend fun waitForChangeThenStable(
+        changeTimeoutMs: Long = 3_000L,
+        stableTimeoutMs: Long = 5_000L,
+        policy: StabilityPolicy = StabilityPolicy.DEFAULT
+    ): WaitOutcome {
+        checkOpen()
+        return WaitEngine(FrameStream(frameCapture, policy))
+            .waitForChangeThenStable(changeTimeoutMs, stableTimeoutMs)
     }
 
     /**
