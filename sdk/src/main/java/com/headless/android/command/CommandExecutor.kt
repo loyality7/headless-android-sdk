@@ -42,7 +42,45 @@ class CommandExecutor(
     private var lastFrame: Screenshot? = null
     private var frameCounter = 0
 
-    fun execute(command: AutomationCommand): CommandResult {
+    // #32: one transaction at a time. ControlService dispatches intents concurrently on
+    // Dispatchers.IO — interleaved input injection + shared lastFrame is never safe.
+    // Blocking under this lock serializes callers; slowness is the point, not a bug.
+    private val execLock = Any()
+
+    fun execute(command: AutomationCommand): CommandResult =
+        execute(command, Expect.None, RetryPolicy(maxAttempts = 1))
+
+    /** Retry loop with expect verification. Single-shot when maxAttempts=1. */
+    fun execute(
+        command: AutomationCommand,
+        expect: Expect = Expect.None,
+        policy: RetryPolicy = RetryPolicy()
+    ): CommandResult = synchronized(execLock) {
+        var last: CommandResult? = null
+        // ponytail: deny-before-execute, no audit log / no two-step handshake yet.
+        if (RetryPolicy.isDestructive(command) && !policy.allowDestructive) {
+            return CommandResult.Failed(
+                command = command,
+                reason = "DangerousActionGuard: $command destroys text and needs allowDestructive=true. Pass confirm explicitly.",
+                screenshotPath = null,
+                currentPackage = null,
+                durationMs = 0L
+            )
+        }
+        for (attempt in 1..policy.maxAttempts) {
+            val result = executeOnce(command)
+            last = result
+            if (!Transaction.shouldRetry(result, attempt, policy, expect)) {
+                if (attempt > 1) HeadlessLog.d(OP, "$command settled attempt=$attempt/${policy.maxAttempts} -> $result")
+                return result
+            }
+            HeadlessLog.d(OP, "$command attempt=$attempt/${policy.maxAttempts} -> $result, retrying")
+            if (policy.backoffMs > 0) Thread.sleep(policy.backoffMs * attempt)
+        }
+        return last!!
+    }
+
+    fun executeOnce(command: AutomationCommand): CommandResult {
         val start = System.currentTimeMillis()
         return try {
             when (command) {
@@ -52,6 +90,9 @@ class CommandExecutor(
                 is AutomationCommand.StopApp -> stopApp(command, start)
                 AutomationCommand.Observe -> observe(command, start)
                 is AutomationCommand.Tap -> act(command, start) { it.tap(command.x, command.y) }
+                is AutomationCommand.TapTarget -> act(command, start) {
+                    kotlinx.coroutines.runBlocking { it.tap(command.target) }
+                }
                 is AutomationCommand.Swipe -> act(command, start) {
                     it.swipe(command.x1, command.y1, command.x2, command.y2, command.durationMs)
                 }
@@ -76,7 +117,11 @@ class CommandExecutor(
 
     private fun requireSession(): HeadlessSession =
         session?.takeIf { it.isOpen }
-            ?: throw IllegalStateException("No open session — issue OpenSession first")
+            ?: throw IllegalStateException(
+                "No open session in THIS client process — issue OpenSession first. " +
+                    "If a session was open before, this process restarted and orphaned it; " +
+                    "OpenSession reaps orphans automatically (#9)."
+            )
 
     private fun openSession(command: AutomationCommand, start: Long): CommandResult {
         session?.takeIf { it.isOpen }?.let { existing ->
