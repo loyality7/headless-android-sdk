@@ -3,75 +3,123 @@ package com.headless.android.capture
 import android.graphics.Bitmap
 import android.media.Image
 import android.media.ImageReader
+import android.os.Handler
+import android.os.HandlerThread
 import com.headless.android.FrameCaptureException
 import com.headless.android.HeadlessLog
+import java.io.Closeable
 
 /**
- * Reads the most recent composited frame off a [HeadlessDisplay]'s [ImageReader].
- * Pure capture — knows nothing about OCR, vision, or Accessibility.
- *
- * ## Idle screens produce no new frames
- *
- * `ImageReader.acquireLatestImage()` only returns an image when the display has composited
- * a *new* frame since the last read. A screen that is simply sitting still — an open menu,
- * a settled page — composites nothing, so naive capture fails on exactly the screens an
- * agent most wants to inspect. Observed on-device as repeated
- * "No frame available yet for display 6" while a Gmail account switcher sat open on screen.
- *
- * So the last successfully captured frame is retained and returned when the reader has
- * nothing new. [Screenshot.timestampNanos] still carries the original composition time, and
- * [Screenshot.isFresh] distinguishes a newly composited frame from a repeat, so callers
- * doing change detection are never misled into thinking a stale frame is new evidence.
+ * Reads composited frames off a [com.headless.android.display.HeadlessDisplay]'s [ImageReader] continuously via a
+ * background [HandlerThread] so the BufferQueue never exhausts, and retains the latest
+ * composited frame for immediate retrieval.
  */
-class FrameCapture(private val imageReader: ImageReader, private val displayId: Int) {
+class FrameCapture(
+    private val imageReader: ImageReader,
+    private val displayId: Int
+) : Closeable {
 
     companion object {
         private const val OP = "FrameCapture"
     }
 
+    private val captureThread: HandlerThread =
+        HandlerThread("HeadlessFrameCapture-$displayId").apply { start() }
+    private val captureHandler: Handler = Handler(captureThread.looper)
+
     @Volatile
     private var lastFrame: Screenshot? = null
 
+    init {
+        imageReader.setOnImageAvailableListener({ reader ->
+            val image: Image = try {
+                reader.acquireLatestImage()
+            } catch (e: Throwable) {
+                null
+            } ?: return@setOnImageAvailableListener
+
+            try {
+                val bitmap = imageToBitmap(image)
+                lastFrame = Screenshot(
+                    width = image.width,
+                    height = image.height,
+                    displayId = displayId,
+                    timestampNanos = image.timestamp,
+                    bitmap = bitmap,
+                    isFresh = true
+                )
+            } catch (e: Throwable) {
+                HeadlessLog.w(OP, "Failed converting frame: ${e.message}")
+            } finally {
+                image.close()
+            }
+        }, captureHandler)
+    }
+
     /**
-     * Captures the latest frame, or re-returns the last known one if the display has not
-     * composited anything new.
+     * Captures the latest frame, or returns the most recently composited frame if the
+     * screen is idle.
      *
-     * Throws [FrameCaptureException] only when there is genuinely nothing to return —
-     * i.e. no new frame *and* no previous frame ever captured for this display.
+     * Waits up to 3000ms for the very first frame if none has arrived yet.
      */
     fun capture(): Screenshot {
-        val image: Image? = try {
-            imageReader.acquireLatestImage()
-        } catch (e: Throwable) {
-            throw FrameCaptureException("acquireLatestImage failed", e)
-        }
-
-        if (image == null) {
-            val cached = lastFrame
-                ?: throw FrameCaptureException(
-                    "No frame available for display $displayId and nothing captured previously " +
-                        "(the display has never composited a frame — is anything running on it?)"
-                )
-            HeadlessLog.d(OP, "no new frame for display $displayId; returning cached frame")
-            return cached.copy(isFresh = false)
-        }
-
-        try {
-            val bitmap = imageToBitmap(image)
+        // Direct read if background listener has already received a frame
+        lastFrame?.let {
             HeadlessLog.event(displayId = displayId, op = OP, success = true)
-            val shot = Screenshot(
-                width = image.width,
-                height = image.height,
-                displayId = displayId,
-                timestampNanos = image.timestamp,
-                bitmap = bitmap,
-                isFresh = true
-            )
-            lastFrame = shot
-            return shot
-        } finally {
-            image.close()
+            return it
         }
+
+        // Try direct acquire in case listener has not triggered yet
+        val directImage = try {
+            imageReader.acquireLatestImage()
+        } catch (_: Throwable) {
+            null
+        }
+
+        if (directImage != null) {
+            try {
+                val bitmap = imageToBitmap(directImage)
+                val shot = Screenshot(
+                    width = directImage.width,
+                    height = directImage.height,
+                    displayId = displayId,
+                    timestampNanos = directImage.timestamp,
+                    bitmap = bitmap,
+                    isFresh = true
+                )
+                lastFrame = shot
+                HeadlessLog.event(displayId = displayId, op = OP, success = true)
+                return shot
+            } finally {
+                directImage.close()
+            }
+        }
+
+        // Wait up to 3000ms for first frame to arrive via listener
+        val deadline = System.currentTimeMillis() + 3000L
+        while (System.currentTimeMillis() < deadline) {
+            lastFrame?.let {
+                HeadlessLog.event(displayId = displayId, op = OP, success = true)
+                return it
+            }
+            try {
+                Thread.sleep(50)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+
+        throw FrameCaptureException(
+            "No frame available for display $displayId and nothing captured previously " +
+                "(the display has not composited a frame — is anything running on it?)"
+        )
+    }
+
+    override fun close() {
+        try {
+            imageReader.setOnImageAvailableListener(null, null)
+        } catch (_: Throwable) {}
+        captureThread.quitSafely()
     }
 
     private fun imageToBitmap(image: Image): Bitmap {
