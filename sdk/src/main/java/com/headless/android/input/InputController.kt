@@ -11,7 +11,8 @@ import com.headless.android.privilege.PrivilegeBackend
  */
 class InputController(
     private val privilegeBackend: PrivilegeBackend,
-    private val displayId: Int
+    private val displayId: Int,
+    private val isolationGuard: DisplayIsolationGuard? = null
 ) {
     companion object {
         private const val OP = "InputController"
@@ -19,24 +20,37 @@ class InputController(
         private const val KEYCODE_BACK = 4
         private const val KEYCODE_DEL = 67
         private const val KEYCODE_TAB = 61
+
+        /**
+         * `input text` uses %s as its space escape (AOSP does a literal replace).
+         * Senders pass RAW text with real spaces — escaping happens here, once, at the
+         * shell boundary. Pre-escaped %s in user input is passed through untouched.
+         */
+        fun escapeForInput(text: String): String = text.replace(" ", "%s")
     }
 
     fun tap(x: Float, y: Float) {
+        isolationGuard?.validateTap(x, y)
         run("tap", x.toInt().toString(), y.toInt().toString())
     }
 
     fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long) {
+        val safe = isolationGuard?.sanitizeSwipe(x1, y1, x2, y2, durationMs)
+        val finalX1 = safe?.x1 ?: x1
+        val finalY1 = safe?.y1 ?: y1
+        val finalX2 = safe?.x2 ?: x2
+        val finalY2 = safe?.y2 ?: y2
+        val finalDuration = safe?.durationMs ?: durationMs
         run(
             "swipe",
-            x1.toInt().toString(), y1.toInt().toString(),
-            x2.toInt().toString(), y2.toInt().toString(),
-            durationMs.toString()
+            finalX1.toInt().toString(), finalY1.toInt().toString(),
+            finalX2.toInt().toString(), finalY2.toInt().toString(),
+            finalDuration.toString()
         )
     }
 
     fun type(text: String) {
-        // `input text` uses %s as its own space escape sequence.
-        run("text", text.replace(" ", "%s"))
+        run("text", escapeForInput(text))
     }
 
     fun pressEnter() = pressKey(KEYCODE_ENTER)
