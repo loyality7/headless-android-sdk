@@ -3,8 +3,11 @@ package com.headless.android
 /** Base type for all SDK-surfaced failures. Internal Android exceptions are wrapped in [cause]. */
 sealed class HeadlessException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
-class ShizukuUnavailableException(message: String = "Shizuku is not running or not reachable") :
-    HeadlessException(message)
+class ShizukuUnavailableException(
+    message: String = "Shizuku binder not delivered to this process — server may run fine " +
+        "while system_server refuses OUR provider bind (\"process is bad\" after force-stop/reinstall). " +
+        "Fix is full uninstall+reinstall (new UID) or reboot, not restarting the server."
+) : HeadlessException(message)
 
 class PermissionDeniedException(message: String = "Privilege backend permission was denied") :
     HeadlessException(message)
