@@ -5,10 +5,26 @@ import com.headless.android.HeadlessLog
 import com.headless.android.PermissionDeniedException
 import com.headless.android.ShizukuUnavailableException
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuBinderWrapper
 import rikka.shizuku.SystemServiceHelper
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+/**
+ * Health status of Shizuku connection and permission.
+ */
+enum class ShizukuHealth {
+    /** Fully connected with permission granted. */
+    READY,
+    /** Shizuku server binder is not present / server not started. */
+    BINDER_NOT_CONNECTED,
+    /** App was reinstalled or user revoked permission. */
+    PERMISSION_REVOKED,
+    /** Stale binder handle received but dead. */
+    BINDER_DEAD
+}
 
 /**
  * [PrivilegeBackend] backed by Shizuku (shell UID 2000). This is the only
@@ -19,9 +35,36 @@ class ShizukuBackend : PrivilegeBackend {
     companion object {
         private const val OP = "ShizukuBackend"
         private const val REQUEST_CODE = 8341 // arbitrary, scoped to this backend
+        const val SHIZUKU_PERMISSION = "moe.shizuku.manager.permission.API_V23"
+
+        fun grantPermissionCommand(packageName: String): String =
+            "adb shell pm grant $packageName $SHIZUKU_PERMISSION"
     }
 
     override val name: String = "shizuku"
+
+    @Volatile
+    private var binderAlive: Boolean = false
+
+    private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
+        binderAlive = true
+        HeadlessLog.i(OP, "Shizuku binder received from service")
+    }
+
+    private val binderDeadListener = Shizuku.OnBinderDeadListener {
+        binderAlive = false
+        HeadlessLog.w(OP, "Shizuku binder died / service killed")
+    }
+
+    init {
+        try {
+            Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
+            Shizuku.addBinderDeadListener(binderDeadListener)
+            binderAlive = Shizuku.pingBinder()
+        } catch (e: Throwable) {
+            HeadlessLog.w(OP, "Failed to register Shizuku lifecycle listeners", e)
+        }
+    }
 
     override fun isAvailable(): Boolean {
         return try {
@@ -29,6 +72,21 @@ class ShizukuBackend : PrivilegeBackend {
         } catch (e: Throwable) {
             HeadlessLog.w(OP, "isAvailable check failed", e)
             false
+        }
+    }
+
+    /**
+     * Comprehensive health evaluation for debugging broken dev loops.
+     */
+    fun health(): ShizukuHealth {
+        val ping = try { Shizuku.pingBinder() } catch (_: Throwable) { false }
+        if (!ping) {
+            return if (!isAvailable()) ShizukuHealth.BINDER_NOT_CONNECTED else ShizukuHealth.BINDER_DEAD
+        }
+        return if (isAuthorized()) {
+            ShizukuHealth.READY
+        } else {
+            ShizukuHealth.PERMISSION_REVOKED
         }
     }
 
@@ -92,27 +150,53 @@ class ShizukuBackend : PrivilegeBackend {
     }
 
     override suspend fun requestAuthorization(): Boolean {
-        if (!isAvailable()) throw ShizukuUnavailableException()
+        return requestAuthorization(10_000L)
+    }
+
+    /**
+     * Requests authorization with timeout protection so a missing user response or
+     * dead binder never hangs the automation dev loop indefinitely.
+     */
+    suspend fun requestAuthorization(timeoutMs: Long): Boolean {
+        if (!isAvailable()) {
+            awaitAvailable(3000L)
+            if (!isAvailable()) throw ShizukuUnavailableException("Shizuku server is not running or reachable")
+        }
         if (isAuthorized()) return true
 
-        return suspendCancellableCoroutine { cont ->
-            val listener = object : Shizuku.OnRequestPermissionResultListener {
-                override fun onRequestPermissionResult(requestCode: Int, grantResult: Int) {
-                    if (requestCode != REQUEST_CODE) return
-                    Shizuku.removeRequestPermissionResultListener(this)
-                    val granted = grantResult == android.content.pm.PackageManager.PERMISSION_GRANTED
-                    HeadlessLog.i(OP, "requestAuthorization result granted=$granted")
-                    if (cont.isActive) cont.resume(granted)
+        return withTimeoutOrNull(timeoutMs) {
+            suspendCancellableCoroutine { cont ->
+                val listener = object : Shizuku.OnRequestPermissionResultListener {
+                    override fun onRequestPermissionResult(requestCode: Int, grantResult: Int) {
+                        if (requestCode != REQUEST_CODE) return
+                        Shizuku.removeRequestPermissionResultListener(this)
+                        val granted = grantResult == android.content.pm.PackageManager.PERMISSION_GRANTED
+                        HeadlessLog.i(OP, "requestAuthorization result granted=$granted")
+                        if (cont.isActive) cont.resume(granted)
+                    }
+                }
+                Shizuku.addRequestPermissionResultListener(listener)
+                cont.invokeOnCancellation { Shizuku.removeRequestPermissionResultListener(listener) }
+                try {
+                    Shizuku.requestPermission(REQUEST_CODE)
+                } catch (e: Throwable) {
+                    Shizuku.removeRequestPermissionResultListener(listener)
+                    if (cont.isActive) cont.resumeWithException(e)
                 }
             }
-            Shizuku.addRequestPermissionResultListener(listener)
-            cont.invokeOnCancellation { Shizuku.removeRequestPermissionResultListener(listener) }
-            Shizuku.requestPermission(REQUEST_CODE)
+        } ?: run {
+            HeadlessLog.w(OP, "requestAuthorization timed out after ${timeoutMs}ms (reinstall or dialog unhandled)")
+            false
         }
     }
 
     override fun getSystemServiceBinder(serviceName: String): IBinder {
-        if (!isAuthorized()) throw PermissionDeniedException("Shizuku permission not granted")
+        if (!isAuthorized()) {
+            val h = health()
+            throw PermissionDeniedException(
+                "Shizuku permission not granted (health=$h). If app was reinstalled, grant permission via: adb shell pm grant <package> $SHIZUKU_PERMISSION"
+            )
+        }
         val raw = SystemServiceHelper.getSystemService(serviceName)
             ?: throw ShizukuUnavailableException("System service '$serviceName' unavailable via Shizuku")
         return ShizukuBinderWrapper(raw)
@@ -129,7 +213,12 @@ class ShizukuBackend : PrivilegeBackend {
     }
 
     private fun startProcess(command: Array<String>): Process {
-        if (!isAuthorized()) throw PermissionDeniedException("Shizuku permission not granted")
+        if (!isAuthorized()) {
+            val h = health()
+            throw PermissionDeniedException(
+                "Shizuku permission not granted (health=$h). If app was reinstalled, grant permission via: adb shell pm grant <package> $SHIZUKU_PERMISSION"
+            )
+        }
         val newProcess = Shizuku::class.java.getDeclaredMethod(
             "newProcess",
             Array<String>::class.java,
@@ -141,6 +230,9 @@ class ShizukuBackend : PrivilegeBackend {
     }
 
     override fun close() {
-        // Shizuku's binder/listener lifecycle is process-wide; nothing owned per-backend to release yet.
+        try {
+            Shizuku.removeBinderReceivedListener(binderReceivedListener)
+            Shizuku.removeBinderDeadListener(binderDeadListener)
+        } catch (_: Throwable) {}
     }
 }
