@@ -3,7 +3,9 @@ package com.headless.example
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import android.util.Log
 import com.headless.android.HeadlessAutomation
+import com.headless.android.HeadlessLog
 import com.headless.android.HeadlessRuntime
 import com.headless.android.command.AutomationCommand
 import com.headless.android.command.CommandExecutor
@@ -40,8 +42,13 @@ class ControlService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private var runtime: HeadlessRuntime? = null
-    private var executor: CommandExecutor? = null
+    // #9: executor/runtime are PROCESS-scoped, not instance-scoped. System churns service
+    // instances under memory pressure (seen: two instances alive at once); a per-instance
+    // session made every second command report "No open session". Any instance reattaches.
+    private object Hub {
+        var runtime: HeadlessRuntime? = null
+        var executor: CommandExecutor? = null
+    }
 
     private val outputDir: File by lazy {
         File(getExternalFilesDir(null) ?: cacheDir, "control").apply { mkdirs() }
@@ -88,13 +95,24 @@ class ControlService : Service() {
 
         scope.launch {
             try {
+                // Test-only IME readback (not an AutomationCommand): what did the field hold?
+                if (cmdName.equals("ime_readback", ignoreCase = true)) {
+                    val ime = com.headless.android.ime.HeadlessImeService
+                    writeLine(
+                        """{"cmd":"ime_readback","bindCount":${ime.bindCount},""" +
+                            """ "snapshot":"${esc(ime.snapshot())}"}"""
+                    )
+                    return@launch
+                }
                 val command = parse(cmdName, intent)
                 if (command == null) {
                     writeLine("""{"cmd":"$cmdName","error":"unknown or malformed command"}""")
                     return@launch
                 }
                 val exec = ensureExecutor()
-                val result = exec.execute(command)
+                val expect = parseExpect(intent)
+                val policy = parsePolicy(intent)
+                val result = exec.execute(command, expect, policy)
                 writeLine(toJson(result))
             } catch (e: Throwable) {
                 writeLine("""{"cmd":"$cmdName","error":"${esc(e.javaClass.simpleName + ": " + e.message)}"}""")
@@ -104,25 +122,29 @@ class ControlService : Service() {
     }
 
     private fun ensureExecutor(): CommandExecutor {
-        executor?.let { return it }
+        synchronized(Hub::class.java) {
+            Hub.executor?.let { return it }
 
-        // Shizuku's binder arrives asynchronously via its ContentProvider after process
-        // start, so a cold-started service must wait for it rather than treating an
-        // immediate negative ping as "Shizuku isn't installed".
         val backend = com.headless.android.privilege.ShizukuBackend()
         if (!backend.awaitAvailable()) {
+            val health = backend.health()
             throw com.headless.android.ShizukuUnavailableException(
-                "Shizuku binder did not arrive within timeout (server may be stopped, " +
-                    "or this app's authorization was revoked by a reinstall)"
+                "Shizuku service is not reachable on device (health=$health)."
             )
         }
 
         val rt = runBlocking {
             val r = HeadlessAutomation.start(applicationContext, backend)
-            if (!r.isAuthorized()) r.requestAuthorization()
+            if (!r.isAuthorized()) {
+                val granted = r.requestAuthorization()
+                if (!granted) {
+                    val health = backend.health()
+                    HeadlessLog.w("ControlService", "Shizuku authorization not granted (health=$health).")
+                }
+            }
             r
         }
-        runtime = rt
+        Hub.runtime = rt
 
         // A previous runtime may have been killed (OEM task cleaner / LMKD) without
         // running its own cleanup, leaving live virtual displays and stale IME records
@@ -130,7 +152,8 @@ class ControlService : Service() {
         val stale = rt.cleanUpStaleState()
         writeLine("""{"event":"startupCleanup","detail":"${esc(stale.summary())}"}""")
 
-        return CommandExecutor(rt, outputDir).also { executor = it }
+        return CommandExecutor(rt, outputDir).also { Hub.executor = it }
+        }
     }
 
     private fun parse(name: String, intent: Intent): AutomationCommand? = when (name.lowercase()) {
@@ -144,11 +167,34 @@ class ControlService : Service() {
         "delete", "deletetext" -> AutomationCommand.DeleteText(intent.getIntExtra("count", 1))
         "launch" -> intent.getStringExtra("pkg")?.let { AutomationCommand.LaunchApp(it) }
         "stop" -> intent.getStringExtra("pkg")?.let { AutomationCommand.StopApp(it) }
-        "type" -> intent.getStringExtra("text")?.let { AutomationCommand.TypeText(it) }
+        "type" -> {
+            // ponytail: textB64 is the reliable path — raw `-e text a b c` gets split by
+            // adb/shell quoting layers before it ever reaches us (observed: "hello world
+            // test" arrived as "hello"). Base64 has no spaces, survives every layer.
+            val b64 = intent.getStringExtra("textB64")
+            if (b64 != null) {
+                try {
+                    val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                    AutomationCommand.TypeText(String(bytes, Charsets.UTF_8))
+                } catch (_: Throwable) { null }
+            } else {
+                intent.getStringExtra("text")?.let { AutomationCommand.TypeText(it) }
+            }
+        }
         "tap" -> {
             val x = intent.getFloatExtra("x", Float.NaN)
             val y = intent.getFloatExtra("y", Float.NaN)
             if (x.isNaN() || y.isNaN()) null else AutomationCommand.Tap(x, y)
+        }
+        "click", "taptarget" -> {
+            val text = intent.getStringExtra("text")
+            val id = intent.getStringExtra("id")
+            val exact = intent.getBooleanExtra("exact", false)
+            when {
+                text != null -> AutomationCommand.TapTarget(com.headless.android.perception.Target.Text(text, exact = exact))
+                id != null -> AutomationCommand.TapTarget(com.headless.android.perception.Target.Id(id))
+                else -> null
+            }
         }
         "swipe" -> {
             val x1 = intent.getFloatExtra("x1", Float.NaN)
@@ -160,6 +206,25 @@ class ControlService : Service() {
             else AutomationCommand.Swipe(x1, y1, x2, y2, dur)
         }
         else -> null
+    }
+
+    private fun parseExpect(intent: Intent): com.headless.android.command.Expect {
+        val raw = intent.getStringExtra("expect") ?: return com.headless.android.command.Expect.None
+        return when {
+            raw == "change" -> com.headless.android.command.Expect.Change
+            raw.startsWith("pkg:") -> com.headless.android.command.Expect.Package(raw.removePrefix("pkg:"))
+            else -> com.headless.android.command.Expect.None
+        }
+    }
+
+    private fun parsePolicy(intent: Intent): com.headless.android.command.RetryPolicy {
+        // ponytail: 3 extras only, defaults = single-shot (old behavior).
+        return com.headless.android.command.RetryPolicy(
+            maxAttempts = intent.getIntExtra("attempts", 1).coerceIn(1, 5),
+            backoffMs = intent.getLongExtra("backoff", 500L),
+            retryOnUncertain = intent.getBooleanExtra("retryUncertain", true),
+            allowDestructive = intent.getBooleanExtra("confirm", false)
+        )
     }
 
     /** Hand-rolled JSON: the result shape is tiny and fixed, and this avoids a dependency. */
@@ -194,7 +259,10 @@ class ControlService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        try { executor?.shutdown() } catch (_: Throwable) {}
-        try { runtime?.close() } catch (_: Throwable) {}
+        // Deliberately NOT shutting down Hub here: instance churn (system destroying +
+        // recreating this service in the same process) must not kill the live session —
+        // the next instance reattaches via Hub. True process death is handled by the
+        // SessionLedger repair path on next open. Shutting down here caused "No open
+        // session" on every other command under memory pressure.
     }
 }
