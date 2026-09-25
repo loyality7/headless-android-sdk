@@ -23,6 +23,9 @@ sealed interface AutomationCommand {
 
     data class Tap(val x: Float, val y: Float) : AutomationCommand
 
+    /** Taps a semantic target (text, id, region, or element) resolved on screen. */
+    data class TapTarget(val target: com.headless.android.perception.Target) : AutomationCommand
+
     data class Swipe(
         val x1: Float,
         val y1: Float,
