@@ -127,9 +127,17 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
         }
     }
 
-    /** Force-stops [packageName]. Returns true if the stop command completed cleanly. */
+    /** Force-stops [packageName] and waits until its tasks are removed from the system. */
     fun stop(packageName: String): Boolean {
         val result = privilegeBackend.shell(arrayOf("am", "force-stop", packageName))
+        // Wait up to 1.5 seconds for ActivityTaskManager to tear down all tasks
+        repeat(15) {
+            if (displayIdsHosting(packageName).isEmpty()) {
+                HeadlessLog.event(packageName = packageName, op = "$OP.stop", success = true)
+                return true
+            }
+            Thread.sleep(100)
+        }
         HeadlessLog.event(packageName = packageName, op = "$OP.stop", success = result.isSuccess)
         return result.isSuccess
     }
