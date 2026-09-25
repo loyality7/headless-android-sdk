@@ -26,13 +26,10 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
         private const val ATM_INTERFACE_TOKEN = "android.app.IActivityTaskManager"
         private const val CALLING_PACKAGE = "com.android.shell"
 
-        // Ground-truth verified on-device (Xiaomi 22041219PI, Android 14 / API 34): reflection
-        // lookup of TRANSACTION_startActivity is unreliable — it can silently resolve to the
-        // WRONG field (observed: 50, which moves the CALLER's own task instead of launching the
-        // target) depending on calling process/classloader. The actually-correct transaction
-        // code for IActivityTaskManager.startActivity on this AIDL build is 1, confirmed by the
-        // POC's own logged DIRECT_ATM_TRANSACTION_CODE=1 / DIRECT_ATM_RESULT=0 / MATCH=true run.
-        private const val TRANSACTION_START_ACTIVITY = 1
+        // [com.headless.android.BinderCodes] resolves the startActivity code per device via
+        // exact-name Stub lookup only (no fuzzy search — fuzzy once resolved the WRONG field
+        // 50, moving the caller's own task). Fallback 1 = POC-verified value on this build,
+        // and launch placement is verified on-display below.
     }
 
     /**
@@ -40,17 +37,19 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
      * [AppLaunchException] if the package can't be resolved or the platform refuses to
      * place it on that display.
      */
-    fun launch(packageName: String, displayId: Int) {
+    fun launch(packageName: String, displayId: Int, uri: Uri? = null) {
         val component = resolveMainComponent(packageName)
             ?: throw AppLaunchException(packageName, "Could not resolve a launchable activity")
 
-        val intent = Intent(Intent.ACTION_MAIN).apply {
+        val action = if (uri != null) Intent.ACTION_VIEW else Intent.ACTION_MAIN
+        val intent = Intent(action).apply {
+            if (uri != null) data = uri
             setClassName(component.substringBefore("/"), resolveClassName(component))
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
         }
 
         try {
-            transactStartActivity(intent, displayId)
+            transactStartActivity(packageName, intent, displayId)
         } catch (e: Throwable) {
             HeadlessLog.event(displayId = displayId, packageName = packageName, op = OP, success = false)
             throw AppLaunchException(packageName, "startActivity transaction failed: ${e.message}", e)
@@ -98,7 +97,7 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
         return if (lastLine.contains("/")) lastLine else null
     }
 
-    private fun transactStartActivity(intent: Intent, displayId: Int) {
+    private fun transactStartActivity(packageName: String, intent: Intent, displayId: Int) {
         val atmBinder = privilegeBackend.getSystemServiceBinder("activity_task")
 
         val data = Parcel.obtain()
@@ -118,8 +117,10 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
             val options = ActivityOptions.makeBasic().apply { launchDisplayId = displayId }
             data.writeTypedObject(options.toBundle(), 0)
 
-            val transacted = atmBinder.transact(TRANSACTION_START_ACTIVITY, data, reply, 0)
-            if (!transacted) throw AppLaunchException("", "Binder transact returned false")
+            val transacted = atmBinder.transact(
+                com.headless.android.BinderCodes.atmStartActivity(), data, reply, 0
+            )
+            if (!transacted) throw AppLaunchException(packageName, "Binder transact returned false")
             reply.readException()
         } finally {
             data.recycle()

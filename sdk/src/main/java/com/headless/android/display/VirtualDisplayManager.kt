@@ -23,29 +23,21 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
 
         // android.hardware.display.DisplayManager virtual-display flag constants (framework-internal
         // for TRUSTED, public for the rest — mirrored here so callers never need the raw ints).
+        private const val FLAG_PUBLIC = 1 shl 0           // DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
+        private const val FLAG_OWN_CONTENT_ONLY = 1 shl 3 // DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
         private const val FLAG_SUPPORTS_TOUCH = 1 shl 6   // DisplayManager.VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH
-        private const val FLAG_TRUSTED = 1 shl 10          // DisplayManager.VIRTUAL_DISPLAY_FLAG_TRUSTED
+        private const val FLAG_TRUSTED = 1 shl 10         // DisplayManager.VIRTUAL_DISPLAY_FLAG_TRUSTED
 
         private const val INTERFACE_TOKEN = "android.hardware.display.IDisplayManager"
-        private const val TRANSACTION_CREATE_VIRTUAL_DISPLAY = 21
         private const val CALLING_PACKAGE = "com.android.shell"
 
         /**
          * `IDisplayManager.releaseVirtualDisplay(IVirtualDisplayCallback token)`.
          *
-         * Per AOSP `core/java/android/hardware/display/IDisplayManager.aidl`, the virtual
-         * display methods are declared in this order:
-         *   createVirtualDisplay        (verified on-device = 21)
-         *   resizeVirtualDisplay        (= 22)
-         *   setVirtualDisplaySurface    (= 23)
-         *   releaseVirtualDisplay       (= 24)
-         *
-         * AIDL assigns transaction codes sequentially in declaration order, so release is
-         * create+3. This is derived rather than guessed, but it is still build-dependent:
-         * [releaseDisplay] therefore verifies the display actually disappeared and reports
-         * failure loudly instead of assuming the transaction worked.
+         * Codes resolve per device via [com.headless.android.BinderCodes] (exact Stub
+         * field lookup, verified fallback). Release still verifies the display actually
+         * disappeared and reports failure loudly instead of assuming success.
          */
-        private const val TRANSACTION_RELEASE_VIRTUAL_DISPLAY = TRANSACTION_CREATE_VIRTUAL_DISPLAY + 3
     }
 
     fun createTrustedDisplay(
@@ -59,7 +51,8 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
         try {
             val displayBinder = privilegeBackend.getSystemServiceBinder("display")
 
-            val flags = FLAG_TRUSTED or FLAG_SUPPORTS_TOUCH
+            val flags = FLAG_TRUSTED or FLAG_OWN_CONTENT_ONLY or FLAG_SUPPORTS_TOUCH
+            HeadlessLog.i(OP, "VirtualDisplay REQUESTED: name=$name width=$width height=$height densityDpi=$densityDpi flags=0x${Integer.toHexString(flags)}")
             val config = VirtualDisplayConfig.Builder(name, width, height, densityDpi)
                 .setFlags(flags)
                 .setSurface(imageReader.surface)
@@ -117,7 +110,7 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
             data.writeStrongBinder(null) // IMediaProjection
             data.writeString(CALLING_PACKAGE)
 
-            displayBinder.transact(TRANSACTION_CREATE_VIRTUAL_DISPLAY, data, reply, 0)
+            displayBinder.transact(com.headless.android.BinderCodes.displayCreate(), data, reply, 0)
             reply.readException()
             return reply.readInt()
         } finally {
@@ -140,7 +133,7 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
         try {
             data.writeInterfaceToken(INTERFACE_TOKEN)
             data.writeStrongBinder(callbackToken)
-            displayBinder.transact(TRANSACTION_RELEASE_VIRTUAL_DISPLAY, data, reply, 0)
+            displayBinder.transact(com.headless.android.BinderCodes.displayRelease(), data, reply, 0)
             reply.readException()
         } catch (e: Throwable) {
             HeadlessLog.event(displayId = displayId, op = "$OP.release", success = false)
