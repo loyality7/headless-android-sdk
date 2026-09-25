@@ -1,8 +1,12 @@
 package com.headless.android
 
+import com.headless.android.perception.PerceptionEngine
+import com.headless.android.perception.ScreenAnalyzer
 import com.headless.android.privilege.PrivilegeBackend
 import com.headless.android.state.DisplayJanitor
+import com.headless.android.state.SessionLedger
 import com.headless.android.state.StateEngine
+import com.headless.android.ime.ImeSwitcher
 
 /**
  * Runtime lifecycle owner. Holds the privilege backend, tracks every live session, and
@@ -21,12 +25,16 @@ import com.headless.android.state.StateEngine
  */
 class HeadlessRuntime internal constructor(
     private val privilegeBackend: PrivilegeBackend,
+    ledgerDir: java.io.File? = null,
+    headlessImeId: String? = null,
     /**
      * Maximum simultaneously-open sessions. Defaults to 1: one agent drives one display.
      * A caller that genuinely needs a second display must close the first or raise this
      * deliberately, rather than leaking displays by accident.
      */
-    val maxSessions: Int = 1
+    val maxSessions: Int = 1,
+    /** Auto-switch system keyboard to the headless IME while a session is open. */
+    val autoSwitchIme: Boolean = true
 ) {
 
     companion object {
@@ -37,6 +45,8 @@ class HeadlessRuntime internal constructor(
 
     private val stateEngine = StateEngine(privilegeBackend)
     private val janitor = DisplayJanitor(privilegeBackend)
+    private val ledger = ledgerDir?.let { SessionLedger(it) }
+    private val imeSwitcher = headlessImeId?.let { ImeSwitcher(privilegeBackend, ledgerDir, it) }
     private val sessions = mutableListOf<HeadlessSession>()
     private val lock = Any()
 
@@ -80,7 +90,8 @@ class HeadlessRuntime internal constructor(
     fun createSession(
         width: Int = DEFAULT_WIDTH,
         height: Int = DEFAULT_HEIGHT,
-        densityDpi: Int = DEFAULT_DENSITY_DPI
+        densityDpi: Int = DEFAULT_DENSITY_DPI,
+        analyzer: ScreenAnalyzer = PerceptionEngine()
     ): HeadlessSession {
         check(!closed) { "HeadlessRuntime is closed" }
         if (!privilegeBackend.isAuthorized()) {
@@ -89,6 +100,7 @@ class HeadlessRuntime internal constructor(
 
         synchronized(lock) {
             reapClosedSessions()
+            repairOrphan()
             check(sessions.size < maxSessions) {
                 "Session limit reached (${sessions.size}/$maxSessions). Close an existing " +
                     "session before creating another — each session holds a virtual display."
@@ -98,8 +110,23 @@ class HeadlessRuntime internal constructor(
                 displayWidth = width,
                 displayHeight = height,
                 displayDensityDpi = densityDpi,
-                onClosed = { closedSession -> synchronized(lock) { sessions.remove(closedSession) } }
+                analyzer = analyzer,
+                ledger = ledger,
+                onClosing = { imeSwitcher?.restore() },
+                onClosed = { closedSession ->
+                    synchronized(lock) {
+                        sessions.remove(closedSession)
+                        if (sessions.none { it.isOpen }) imeSwitcher?.restore()
+                    }
+                }
             )
+            sessions.add(session)
+            if (autoSwitchIme && imeSwitcher?.switchToHeadless() == false) {
+                HeadlessLog.w(
+                    "HeadlessRuntime",
+                    "headless IME switch failed — text focus may crash Gboard (#1); non-text automation unaffected"
+                )
+            }
             sessions.add(session)
             HeadlessLog.event(
                 sessionId = session.id,
@@ -113,6 +140,29 @@ class HeadlessRuntime internal constructor(
 
     private fun reapClosedSessions() {
         sessions.removeAll { !it.isOpen }
+    }
+
+    /**
+     * #9 repair: a previous process died holding a session. Its display is gone but its
+     * app may have reparented onto Display 0. Force-stop the orphan BEFORE creating
+     * anything new, so the new client never inherits it.
+     */
+    private fun repairOrphan() {
+        val l = ledger ?: return
+        val orphan = try {
+            l.orphanedPackage(janitor.liveDisplayIds())
+        } catch (e: Throwable) {
+            HeadlessLog.w("HeadlessRuntime", "orphan check failed", e)
+            return
+        } ?: return
+        try {
+            privilegeBackend.shell(arrayOf("am", "force-stop", orphan))
+            HeadlessLog.i("HeadlessRuntime", "reaped orphan session app: $orphan")
+        } catch (e: Throwable) {
+            HeadlessLog.w("HeadlessRuntime", "orphan force-stop failed for $orphan", e)
+        } finally {
+            l.clear()
+        }
     }
 
     /**
@@ -133,6 +183,7 @@ class HeadlessRuntime internal constructor(
             }
         }
         synchronized(lock) { sessions.clear() }
+        try { imeSwitcher?.restore() } catch (_: Throwable) {}
 
         // Final leak check: if any non-default display survived our own cleanup, say so
         // loudly rather than exiting quietly and leaving the user with a misbehaving

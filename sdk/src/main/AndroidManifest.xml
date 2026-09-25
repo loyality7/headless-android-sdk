@@ -13,6 +13,19 @@
             android:enabled="true"
             android:exported="true"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- Null keyboard for hidden-display automation: survives focus, shows nothing. -->
+        <service
+            android:name="com.headless.android.ime.HeadlessImeService"
+            android:exported="false"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/headless_ime" />
+        </service>
     </application>
 
 </manifest>

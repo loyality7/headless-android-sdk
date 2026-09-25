@@ -17,11 +17,15 @@ import com.headless.android.privilege.ShizukuBackend
 object HeadlessAutomation {
 
     /**
-     * Starts the runtime with the given (or default) [PrivilegeBackend]. [context] is
-     * accepted for API symmetry with future backends that need it; the current
-     * [ShizukuBackend] doesn't require it.
+     * Starts the runtime with the given (or default on-device [ShizukuBackend]).
      */
     fun start(context: Context, backend: PrivilegeBackend = ShizukuBackend()): HeadlessRuntime {
-        return HeadlessRuntime(backend)
+        val pkg = context.packageName
+        return HeadlessRuntime(
+            backend,
+            ledgerDir = java.io.File(context.filesDir, "headless"),
+            headlessImeId = "$pkg/com.headless.android.ime.HeadlessImeService",
+            autoSwitchIme = true
+        )
     }
 }

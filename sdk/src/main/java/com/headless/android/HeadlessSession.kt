@@ -1,11 +1,13 @@
 package com.headless.android
 
+import android.net.Uri
 import com.headless.android.apps.AppLauncher
 import com.headless.android.capture.FrameCapture
 import com.headless.android.capture.Screenshot
 import com.headless.android.display.HeadlessDisplay
 import com.headless.android.display.ImeIsolation
 import com.headless.android.display.VirtualDisplayManager
+import com.headless.android.input.DisplayIsolationGuard
 import com.headless.android.input.InputController
 import com.headless.android.observation.Condition
 import com.headless.android.observation.FrameStream
@@ -14,6 +16,11 @@ import com.headless.android.observation.StabilityPolicy
 import com.headless.android.observation.WaitEngine
 import com.headless.android.observation.WaitOutcome
 import kotlinx.coroutines.flow.Flow
+import com.headless.android.perception.PerceptionEngine
+import com.headless.android.perception.ScreenAnalyzer
+import com.headless.android.perception.ScreenElement
+import com.headless.android.perception.ScreenObservation
+import com.headless.android.perception.Target
 import com.headless.android.privilege.PrivilegeBackend
 import com.headless.android.state.SessionState
 import com.headless.android.state.StateEngine
@@ -30,6 +37,15 @@ class HeadlessSession internal constructor(
     displayWidth: Int,
     displayHeight: Int,
     displayDensityDpi: Int,
+    val analyzer: ScreenAnalyzer = PerceptionEngine(),
+    private val ledger: com.headless.android.state.SessionLedger? = null,
+    /**
+     * Runs at the START of [close], before the app is stopped and the display released.
+     * Used to restore the user's keyboard while the display still exists: releasing a
+     * display while a custom IME is still default crashed the process (system binds the
+     * IME for the dying display with a null display token).
+     */
+    private val onClosing: () -> Unit = {},
     /** Invoked once when this session finishes closing, so the runtime can stop tracking it. */
     private val onClosed: (HeadlessSession) -> Unit = {}
 ) {
@@ -42,20 +58,32 @@ class HeadlessSession internal constructor(
 
     val displayId: Int get() = display.displayId
 
+    val isolationGuard = DisplayIsolationGuard(
+        privilegeBackend = privilegeBackend,
+        displayId = display.displayId,
+        displayWidth = displayWidth,
+        displayHeight = displayHeight
+    )
+
     private val appLauncher = AppLauncher(privilegeBackend)
-    private val inputController = InputController(privilegeBackend, display.displayId)
+    private val inputController = InputController(privilegeBackend, display.displayId, isolationGuard)
     private val frameCapture = FrameCapture(display.imageReader, display.displayId)
     private val stateEngine = StateEngine(privilegeBackend)
 
     /**
-     * Attempt to prevent this display from ever showing a soft keyboard.
+     * Keeps the IME's window on the default display instead of this one.
      *
-     * Runs at construction, before any app can take text focus. The default secondary-display
-     * policy (FALLBACK_DISPLAY) puts the keyboard on the USER'S physical display, which was
-     * observed happening during automation and is a hard isolation violation.
+     * Runs at construction, before any app can take text focus. LOCAL was tried first (IME
+     * confined to this display) but Android refuses to host an IME window on a non-system-owned
+     * virtual display (source.android.com/docs/core/display/multi_display/ime-support) and
+     * crashes WindowProviderService.createServiceBaseContext with a null Display when IMMS
+     * rebinds the IME there on focus. FALLBACK_DISPLAY avoids that rebind entirely — the IME's
+     * window stays on display 0, but since HeadlessImeService has no UI (onCreateInputView
+     * returns null) nothing is actually visible there, and its InputConnection still targets
+     * the focused editor on THIS display regardless of where the IME window lives.
      */
     val imeIsolation: ImeIsolation.Report =
-        ImeIsolation(privilegeBackend).isolate(display.displayId)
+        ImeIsolation(privilegeBackend).isolate(display.displayId, ImeIsolation.POLICY_FALLBACK_DISPLAY)
 
     /** Package launched through this session, tracked so [close] can stop it. */
     @Volatile
@@ -64,16 +92,19 @@ class HeadlessSession internal constructor(
     @Volatile
     private var closed = false
 
+    private val closeLock = Any()
+
     val isOpen: Boolean get() = !closed
 
     /** Live snapshot of this session's state, queried from the platform. */
     fun state(): SessionState = stateEngine.sessionState(id, display.displayId, !closed)
 
-    fun launch(packageName: String) {
+    fun launch(packageName: String, uri: Uri? = null) {
         checkOpen()
-        appLauncher.launch(packageName, display.displayId)
+        appLauncher.launch(packageName, display.displayId, uri)
         launchedPackage = packageName
         inputAllowed = true
+        ledger?.record(id, display.displayId, packageName)
     }
 
     /**
@@ -101,8 +132,8 @@ class HeadlessSession internal constructor(
                 "Refusing $action: no app has been launched in this session, so the target " +
                     "display's contents are unverified. Call launch() first."
             )
-        check(inputAllowed) {
-            "Refusing $action: launch was never verified for this session."
+        if (!inputAllowed) {
+            throw InputInjectionException("Refusing $action: launch was never verified for this session.")
         }
         val hosting = appLauncher.displayIdsHosting(pkg)
         if (!hosting.contains(display.displayId)) {
@@ -113,11 +144,21 @@ class HeadlessSession internal constructor(
                     "deliver input to the user's physical screen."
             )
         }
+        if (action in listOf("type", "pressEnter", "pressBack", "pressTab", "deleteText", "clearText")) {
+            isolationGuard.validateKeyInjection(action, pkg)
+        }
+    }
+
+    /** Probes Display 0 to verify it has not been contaminated (e.g. keyboard showing on Display 0). */
+    fun checkDisplayZero(): DisplayIsolationGuard.DisplayZeroStatus {
+        checkOpen()
+        return isolationGuard.probeDisplayZero()
     }
 
     /** Force-stops [packageName]. Returns true if the stop command completed cleanly. */
     fun stopApp(packageName: String): Boolean {
         checkOpen()
+        ledger?.clear()
         return appLauncher.stop(packageName)
     }
 
@@ -136,6 +177,60 @@ class HeadlessSession internal constructor(
     fun tap(x: Float, y: Float) {
         checkInputAllowed("tap")
         inputController.tap(x, y)
+    }
+
+    /** Analyzes the current screen and returns a structured [ScreenObservation]. */
+    suspend fun observe(): ScreenObservation {
+        checkOpen()
+        val shot = screenshot()
+        return analyzer.analyze(shot)
+    }
+
+    /** Finds the first perceived element matching [target], or null if not found. */
+    suspend fun find(target: Target): ScreenElement? {
+        val obs = observe()
+        return (analyzer as? PerceptionEngine)?.resolve(target, obs)
+    }
+
+    /** Finds all perceived elements matching [target]. */
+    suspend fun findAll(target: Target): List<ScreenElement> {
+        val obs = observe()
+        return (analyzer as? PerceptionEngine)?.resolveAll(target, obs) ?: emptyList()
+    }
+
+    /**
+     * Taps a semantic [Target].
+     *
+     * If [target] is a [Target.Element], checks staleness: if older than [maxStalenessMs],
+     * throws [TargetStalenessException].
+     * If [target] is a query ([Target.Text], [Target.Id], [Target.Region]), searches the
+     * live screen via [observe] and taps the matching element's center.
+     * Throws [TargetNotFoundException] if no matching element exists.
+     */
+    suspend fun tap(target: Target, maxStalenessMs: Long = 3000L) {
+        checkInputAllowed("tap(target)")
+        val element: ScreenElement = when (target) {
+            is Target.Point -> {
+                tap(target.x, target.y)
+                return
+            }
+            is Target.Element -> {
+                val age = target.element.ageMs()
+                if (age > maxStalenessMs) {
+                    throw TargetStalenessException(
+                        targetDescription = target.description,
+                        ageMs = age,
+                        maxAgeMs = maxStalenessMs
+                    )
+                }
+                target.element
+            }
+            else -> {
+                find(target) ?: throw TargetNotFoundException(target.description)
+            }
+        }
+
+        tap(element.centerX, element.centerY)
     }
 
     fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long) {
@@ -253,17 +348,29 @@ class HeadlessSession internal constructor(
      * believing it still owns a session it cannot clean up.
      */
     fun close() {
+        // #32: double-close from two threads must not double-stop/double-release.
+        synchronized(closeLock) {
         if (closed) return
         closed = true
+        try { onClosing() } catch (_: Throwable) {}
+        ledger?.clear()
 
         var failure: Throwable? = null
 
         launchedPackage?.let { pkg ->
             try {
                 appLauncher.stop(pkg)
+                // Small grace period to allow WindowManager to finalize window cleanup
+                Thread.sleep(200)
             } catch (e: Throwable) {
                 HeadlessLog.w("HeadlessSession", "failed stopping $pkg during close", e)
             }
+        }
+
+        try {
+            frameCapture.close()
+        } catch (e: Throwable) {
+            HeadlessLog.w("HeadlessSession", "failed closing frameCapture", e)
         }
 
         try {
@@ -283,6 +390,7 @@ class HeadlessSession internal constructor(
         onClosed(this)
 
         failure?.let { throw it }
+        }
     }
 
     private fun checkOpen() {
