@@ -24,6 +24,9 @@ android {
     kotlinOptions {
         jvmTarget = '21'
     }
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
 }
 
 dependencies {

@@ -36,3 +36,21 @@ dependencies {
     implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.7.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
 }
+
+afterEvaluate {
+    tasks.named("installDebug").configure {
+        doLast {
+            try {
+                def adb = android.adbExecutable.toString()
+                exec {
+                    commandLine adb, "shell", "pm", "grant", "com.headless.example", "moe.shizuku.manager.permission.API_V23"
+                    ignoreExitValue = true
+                }
+                println "Auto-granted moe.shizuku.manager.permission.API_V23 to com.headless.example"
+            } catch (Exception e) {
+                logger.warn("Could not auto-grant Shizuku permission: " + e.message)
+            }
+        }
+    }
+}
+

@@ -14,19 +14,21 @@ object HeadlessLog {
     var verbose: Boolean = false
 
     fun d(op: String, message: String) {
-        if (verbose) Log.d(TAG, "[$op] $message")
+        if (verbose) {
+            try { Log.d(TAG, "[$op] $message") } catch (_: Throwable) { println("[$TAG][$op] $message") }
+        }
     }
 
     fun i(op: String, message: String) {
-        Log.i(TAG, "[$op] $message")
+        try { Log.i(TAG, "[$op] $message") } catch (_: Throwable) { println("[$TAG][$op] $message") }
     }
 
     fun w(op: String, message: String, cause: Throwable? = null) {
-        Log.w(TAG, "[$op] $message", cause)
+        try { Log.w(TAG, "[$op] $message", cause) } catch (_: Throwable) { println("[$TAG][$op] $message: $cause") }
     }
 
     fun e(op: String, message: String, cause: Throwable? = null) {
-        Log.e(TAG, "[$op] $message", cause)
+        try { Log.e(TAG, "[$op] $message", cause) } catch (_: Throwable) { System.err.println("[$TAG][$op] $message: $cause") }
     }
 
     /** Structured event line: session id, display id, package, operation, duration, outcome. */
