@@ -29,10 +29,17 @@ object BinderCodes {
         "TRANSACTION_startActivity", 1
     )
 
+    fun inputInject(): Int = stubCode(
+        "android.hardware.input.IInputManager\$Stub",
+        "TRANSACTION_injectInputEvent", 10
+    )
+
     // Separated for JVM tests (Class.forName never resolves on unit-test classpath).
     internal fun stubCode(stubClassName: String, fieldName: String, fallback: Int): Int {
         return try {
-            val field = Class.forName(stubClassName).getDeclaredField(fieldName)
+            val field = Class.forName(stubClassName).getDeclaredField(fieldName).apply {
+                isAccessible = true
+            }
             val code = field.getInt(null)
             if (code == fallback) {
                 HeadlessLog.i("BinderCodes", "$fieldName=$code (matches fallback)")

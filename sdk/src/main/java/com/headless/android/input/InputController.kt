@@ -12,7 +12,8 @@ import com.headless.android.privilege.PrivilegeBackend
 class InputController(
     private val privilegeBackend: PrivilegeBackend,
     private val displayId: Int,
-    private val isolationGuard: DisplayIsolationGuard? = null
+    private val isolationGuard: DisplayIsolationGuard? = null,
+    private val directInjector: BinderInputInjector? = BinderInputInjector(privilegeBackend, displayId)
 ) {
     companion object {
         private const val OP = "InputController"
@@ -31,6 +32,10 @@ class InputController(
 
     fun tap(x: Float, y: Float) {
         isolationGuard?.validateTap(x, y)
+        if (directInjector?.tap(x, y) == true) {
+            HeadlessLog.i(OP, "tap($x, $y) injected via direct Binder")
+            return
+        }
         run("tap", x.toInt().toString(), y.toInt().toString())
     }
 
@@ -41,6 +46,11 @@ class InputController(
         val finalX2 = safe?.x2 ?: x2
         val finalY2 = safe?.y2 ?: y2
         val finalDuration = safe?.durationMs ?: durationMs
+
+        if (directInjector?.swipe(finalX1, finalY1, finalX2, finalY2, finalDuration) == true) {
+            HeadlessLog.i(OP, "swipe injected via direct Binder")
+            return
+        }
         run(
             "swipe",
             finalX1.toInt().toString(), finalY1.toInt().toString(),
@@ -62,12 +72,21 @@ class InputController(
     /**
      * Deletes [count] characters backwards from the cursor.
      *
-     * Sent as repeated DEL keyevents in a single `input` invocation where possible, since
-     * one shell round-trip per character is prohibitively slow (each measured ~1.3-2.5s
-     * end to end in the audit).
+     * Injected via direct Binder when possible (<10ms per DEL), falling back to single
+     * multi-arg shell invocation.
      */
     fun deleteText(count: Int) {
         require(count > 0) { "count must be > 0" }
+        if (directInjector != null) {
+            var allOk = true
+            for (i in 0 until count) {
+                if (!directInjector.pressKey(KEYCODE_DEL)) {
+                    allOk = false
+                    break
+                }
+            }
+            if (allOk) return
+        }
         val args = Array(count) { KEYCODE_DEL.toString() }
         run("keyevent", *args)
     }
@@ -85,6 +104,10 @@ class InputController(
     }
 
     private fun pressKey(keyCode: Int) {
+        if (directInjector?.pressKey(keyCode) == true) {
+            HeadlessLog.i(OP, "pressKey($keyCode) injected via direct Binder")
+            return
+        }
         run("keyevent", keyCode.toString())
     }
 

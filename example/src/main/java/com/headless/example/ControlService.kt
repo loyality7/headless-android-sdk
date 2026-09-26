@@ -122,6 +122,11 @@ class ControlService : Service() {
                     writeLine(report)
                     return@launch
                 }
+                if (cmdName.equals("test_input_benchmark", ignoreCase = true)) {
+                    val report = runInputBenchmarkAudit()
+                    writeLine(report)
+                    return@launch
+                }
                 val command = parse(cmdName, intent)
                 if (command == null) {
                     writeLine("""{"cmd":"$cmdName","error":"unknown or malformed command"}""")
@@ -392,6 +397,57 @@ class ControlService : Service() {
             """{"outcome":"VERIFIED","test":"dump_all","displayId":$dId,"dumpSuccess":${dumpResult.exitCode == 0},"hasDisplayId":$hasDisplayId,"hasChrome":$hasChrome,"preview":"$preview"}"""
         } catch (e: Throwable) {
             """{"outcome":"FAILED","test":"dump_all","reason":"${esc(e.javaClass.simpleName + ": " + e.message)}"}"""
+        } finally {
+            rt.close()
+        }
+    }
+
+    private suspend fun runInputBenchmarkAudit(): String = withContext(Dispatchers.IO) {
+        val backend = com.headless.android.privilege.ShizukuBackend()
+        backend.awaitAvailable()
+        if (!backend.isAuthorized()) {
+            backend.requestAuthorization()
+        }
+        val rt = HeadlessAutomation.start(
+            context = applicationContext,
+            backend = backend,
+            maxSessions = 1,
+            autoSwitchIme = true
+        )
+        try {
+            val s = rt.createSession()
+            val dId = s.displayId
+            s.launch("com.android.chrome")
+            kotlinx.coroutines.delay(2000)
+
+            val directInjector = com.headless.android.input.BinderInputInjector(backend, dId)
+
+            // Benchmark Direct Binder Taps (10 taps)
+            val directTimes = mutableListOf<Long>()
+            for (i in 1..10) {
+                val t0 = System.currentTimeMillis()
+                val ok = directInjector.tap(500f, 500f)
+                val dt = System.currentTimeMillis() - t0
+                if (ok) directTimes.add(dt)
+            }
+
+            // Benchmark Shell Taps (5 taps)
+            val shellTimes = mutableListOf<Long>()
+            for (i in 1..5) {
+                val t0 = System.currentTimeMillis()
+                val res = backend.shell(arrayOf("input", "-d", dId.toString(), "tap", "500", "500"))
+                val dt = System.currentTimeMillis() - t0
+                if (res.exitCode == 0) shellTimes.add(dt)
+            }
+
+            val directMedian = if (directTimes.isNotEmpty()) directTimes.sorted()[directTimes.size / 2] else -1
+            val directP95 = if (directTimes.isNotEmpty()) directTimes.sorted()[(directTimes.size * 95) / 100] else -1
+            val shellMedian = if (shellTimes.isNotEmpty()) shellTimes.sorted()[shellTimes.size / 2] else -1
+
+            s.close()
+            """{"outcome":"VERIFIED","test":"input_benchmark","directMedianMs":$directMedian,"directP95Ms":$directP95,"shellMedianMs":$shellMedian,"speedupRatio":${if (directMedian > 0) String.format(java.util.Locale.US, "%.1fx", shellMedian.toDouble() / directMedian) else "\"N/A\""}}"""
+        } catch (e: Throwable) {
+            """{"outcome":"FAILED","test":"input_benchmark","reason":"${esc(e.javaClass.simpleName + ": " + e.message)}"}"""
         } finally {
             rt.close()
         }
