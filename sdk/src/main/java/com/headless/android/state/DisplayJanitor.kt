@@ -23,9 +23,21 @@ import com.headless.android.privilege.PrivilegeBackend
  */
 class DisplayJanitor(private val privilegeBackend: PrivilegeBackend) {
 
-    private companion object {
+    companion object {
         const val OP = "DisplayJanitor"
         const val DEFAULT_DISPLAY = 0
+        const val STALE_IME_REBOOT_THRESHOLD = 50
+    }
+
+    enum class ConsumerAdvice {
+        /** Everything is clean. Normal operation. */
+        NORMAL,
+        /** Leaked displays from previous unreleased runs or other processes exist. */
+        WARN_LEAKED_DISPLAYS,
+        /** Inert stale IME records exist in system_server, keyboard dismissed on display 0. Safe to proceed. */
+        WARN_STALE_IME_SAFE_TO_PROCEED,
+        /** High volume of stale records (>= 50). Safe to proceed, but reboot advised during scheduled maintenance. */
+        ADVISE_REBOOT
     }
 
     data class Report(
@@ -41,10 +53,19 @@ class DisplayJanitor(private val privilegeBackend: PrivilegeBackend) {
         val hasLeakedDisplays: Boolean get() = nonDefaultDisplayIds.isNotEmpty()
         val hasStaleImeState: Boolean get() = staleImeDisplayIds.isNotEmpty()
 
+        val advice: ConsumerAdvice
+            get() = when {
+                hasLeakedDisplays -> ConsumerAdvice.WARN_LEAKED_DISPLAYS
+                staleImeDisplayIds.size >= STALE_IME_REBOOT_THRESHOLD -> ConsumerAdvice.ADVISE_REBOOT
+                hasStaleImeState -> ConsumerAdvice.WARN_STALE_IME_SAFE_TO_PROCEED
+                else -> ConsumerAdvice.NORMAL
+            }
+
         fun summary(): String = buildString {
             append("live=${liveDisplayIds.sorted()}")
             append(" nonDefault=${nonDefaultDisplayIds.sorted()}")
             append(" staleImeRecords=${staleImeDisplayIds.size}")
+            append(" advice=$advice")
         }
     }
 
@@ -122,6 +143,14 @@ class DisplayJanitor(private val privilegeBackend: PrivilegeBackend) {
                     "hiding IME. Records persist in system_server until reboot."
             )
             hideKeyboard()
+        }
+
+        if (report.advice == ConsumerAdvice.ADVISE_REBOOT) {
+            HeadlessLog.w(
+                OP,
+                "High volume of stale IME records (${report.staleImeDisplayIds.size}) accumulated in system_server. " +
+                    "While safe to proceed, a device reboot is advised during scheduled maintenance."
+            )
         }
 
         HeadlessLog.event(op = "$OP.cleanUp", success = true)
