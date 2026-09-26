@@ -115,6 +115,13 @@ class HeadlessSession internal constructor(
     private val inputController = InputController(privilegeBackend, display.displayId, isolationGuard)
     private val frameCapture = FrameCapture(display.imageReader, display.displayId)
     private val stateEngine = StateEngine(privilegeBackend)
+    val uiExtractor = com.headless.android.perception.UiHierarchyExtractor(privilegeBackend, display.displayId)
+
+    val effectiveAnalyzer: ScreenAnalyzer = if (analyzer is PerceptionEngine && analyzer.detectionProvider == null) {
+        PerceptionEngine(com.headless.android.perception.AccessibilityDetectionProvider(uiExtractor) { launchedPackage ?: currentApp() })
+    } else {
+        analyzer
+    }
 
     /**
      * Keeps the IME's window on the default display instead of this one.
@@ -309,19 +316,87 @@ class HeadlessSession internal constructor(
     suspend fun observe(): ScreenObservation {
         checkOpen()
         val shot = screenshot()
-        return analyzer.analyze(shot)
+        return effectiveAnalyzer.analyze(shot)
     }
 
     /** Finds the first perceived element matching [target], or null if not found. */
     suspend fun find(target: Target): ScreenElement? {
         val obs = observe()
-        return (analyzer as? PerceptionEngine)?.resolve(target, obs)
+        return (effectiveAnalyzer as? PerceptionEngine)?.resolve(target, obs)
     }
 
     /** Finds all perceived elements matching [target]. */
     suspend fun findAll(target: Target): List<ScreenElement> {
         val obs = observe()
-        return (analyzer as? PerceptionEngine)?.resolveAll(target, obs) ?: emptyList()
+        return (effectiveAnalyzer as? PerceptionEngine)?.resolveAll(target, obs) ?: emptyList()
+    }
+
+    /**
+     * Dumps and returns the live UI hierarchy tree for this session's window (#23).
+     */
+    suspend fun uiTree(): com.headless.android.perception.UiNode? {
+        checkOpen()
+        return uiExtractor.dump(targetPackage = launchedPackage ?: currentApp())
+    }
+
+    /**
+     * Finds a specific UI node on the current screen by text query or resource ID.
+     */
+    suspend fun findNode(query: String, exact: Boolean = false): com.headless.android.perception.UiNode? {
+        val tree = uiTree() ?: return null
+        return tree.findByText(query, exact = exact) ?: tree.findById(query)
+    }
+
+    /**
+     * Clicks directly on a [com.headless.android.perception.UiNode] by its center coordinates.
+     */
+    suspend fun click(node: com.headless.android.perception.UiNode) {
+        tap(node.centerX, node.centerY)
+    }
+
+    /**
+     * Finds a UI element by text or resource ID and taps its center.
+     * Throws [TargetNotFoundException] if the element is not found in the UI tree.
+     */
+    suspend fun click(textOrId: String, exact: Boolean = false) {
+        val node = findNode(textOrId, exact = exact)
+            ?: throw TargetNotFoundException("UI node '$textOrId' not found on display ${display.displayId}")
+        click(node)
+    }
+
+    /**
+     * Dumps and compresses the UI tree into a token-efficient [com.headless.android.perception.CompactUiSnapshot] (#23).
+     */
+    suspend fun compactUi(): com.headless.android.perception.CompactUiSnapshot? {
+        val tree = uiTree() ?: return null
+        return com.headless.android.perception.UiTreeCompressor.compress(tree)
+    }
+
+    /**
+     * Returns a formatted numbered element list of the current screen for LLM prompt context (#23).
+     */
+    suspend fun uiPrompt(): String {
+        return compactUi()?.toPromptText() ?: "No active UI elements detected on display ${display.displayId}."
+    }
+
+    /**
+     * Clicks an element by its 1-based index from [compactUi] / [uiPrompt] (#23).
+     */
+    suspend fun click(elementIndex: Int) {
+        val snapshot = compactUi()
+            ?: throw TargetNotFoundException("Cannot click index [$elementIndex]: UI snapshot was null")
+        val element = snapshot.findByIndex(elementIndex)
+            ?: throw TargetNotFoundException("Element index [$elementIndex] not found in snapshot (${snapshot.elements.size} elements)")
+        tap(element.centerX, element.centerY)
+    }
+
+    /**
+     * Clicks an element by index, then types text into it (#23).
+     */
+    suspend fun enterText(elementIndex: Int, text: String) {
+        click(elementIndex)
+        kotlinx.coroutines.delay(100)
+        type(text)
     }
 
     /**

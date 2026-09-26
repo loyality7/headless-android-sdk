@@ -14,7 +14,7 @@ interface ElementDetectionProvider {
  * Primary on-device perception engine that analyzes screenshots and resolves semantic [Target]s.
  */
 class PerceptionEngine(
-    private val detectionProvider: ElementDetectionProvider? = null
+    val detectionProvider: ElementDetectionProvider? = null
 ) : ScreenAnalyzer {
 
     override val name: String = "PerceptionEngine"

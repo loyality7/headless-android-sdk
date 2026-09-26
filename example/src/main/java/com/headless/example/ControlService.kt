@@ -127,6 +127,11 @@ class ControlService : Service() {
                     writeLine(report)
                     return@launch
                 }
+                if (cmdName.equals("test_ui_tree", ignoreCase = true)) {
+                    val report = runUiTreeAudit()
+                    writeLine(report)
+                    return@launch
+                }
                 val command = parse(cmdName, intent)
                 if (command == null) {
                     writeLine("""{"cmd":"$cmdName","error":"unknown or malformed command"}""")
@@ -450,6 +455,41 @@ class ControlService : Service() {
             """{"outcome":"FAILED","test":"input_benchmark","reason":"${esc(e.javaClass.simpleName + ": " + e.message)}"}"""
         } finally {
             rt.close()
+        }
+    }
+
+    private suspend fun runUiTreeAudit(): String = withContext(Dispatchers.IO) {
+        ensureExecutor()
+        val rt = Hub.runtime ?: throw IllegalStateException("Runtime not initialized")
+        try {
+            val s = rt.createSession()
+            val dId = s.displayId
+            s.launch("com.android.chrome", android.net.Uri.parse("https://google.com"))
+            kotlinx.coroutines.delay(3000)
+
+            val t0 = System.currentTimeMillis()
+            val snapshot = s.compactUi()
+            val dumpMs = System.currentTimeMillis() - t0
+
+            if (snapshot == null) {
+                s.close()
+                return@withContext """{"outcome":"FAILED","test":"ui_tree","reason":"snapshot was null"}"""
+            }
+
+            val prompt = snapshot.toPromptText()
+            android.util.Log.i("HeadlessPrompt", "--- COMPACT LLM PROMPT ---\n$prompt")
+
+            // Test clicking by 1-based index (e.g. index 1)
+            var clickByIndexOk = false
+            if (snapshot.elements.isNotEmpty()) {
+                s.click(1)
+                clickByIndexOk = true
+            }
+
+            s.close()
+            """{"outcome":"VERIFIED","test":"ui_tree","displayId":$dId,"dumpMs":$dumpMs,"elementsCount":${snapshot.elements.size},"promptChars":${prompt.length},"clickByIndexOk":$clickByIndexOk,"sampleElement":"${esc(snapshot.elements.firstOrNull()?.toPromptLine())}"}"""
+        } catch (e: Throwable) {
+            """{"outcome":"FAILED","test":"ui_tree","reason":"${esc(e.javaClass.simpleName + ": " + e.message)}"}"""
         }
     }
 
