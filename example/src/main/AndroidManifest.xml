@@ -18,6 +18,8 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.Light">
 
+        <!-- Administrative and status dashboard (#20). Headless automation agents interact
+             strictly via ControlService, leaving Display 0 undisturbed. -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
