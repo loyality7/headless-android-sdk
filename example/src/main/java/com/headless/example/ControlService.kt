@@ -117,6 +117,11 @@ class ControlService : Service() {
                     writeLine(report)
                     return@launch
                 }
+                if (cmdName.equals("test_dump_all", ignoreCase = true)) {
+                    val report = runDumpAllAudit()
+                    writeLine(report)
+                    return@launch
+                }
                 val command = parse(cmdName, intent)
                 if (command == null) {
                     writeLine("""{"cmd":"$cmdName","error":"unknown or malformed command"}""")
@@ -346,6 +351,47 @@ class ControlService : Service() {
             """{"outcome":"VERIFIED","test":"multisession","d1":$d1,"d2":$d2,"p1":"$p1","p2":"$p2","f1Size":$f1Size,"f2Size":$f2Size,"s1Closed":${!s1OpenAfterClose},"s2Survived":$s2OpenAfterS1Close,"s2Closed":${!s2OpenAfterClose},"leakedDisplays":${leaks.size}}"""
         } catch (e: Throwable) {
             """{"outcome":"FAILED","test":"multisession","reason":"${esc(e.javaClass.simpleName + ": " + e.message)}"}"""
+        } finally {
+            rt.close()
+        }
+    }
+
+    private suspend fun runDumpAllAudit(): String = withContext(Dispatchers.IO) {
+        val backend = com.headless.android.privilege.ShizukuBackend()
+        backend.awaitAvailable()
+        if (!backend.isAuthorized()) {
+            backend.requestAuthorization()
+        }
+        val rt = HeadlessAutomation.start(
+            context = applicationContext,
+            backend = backend,
+            maxSessions = 1,
+            autoSwitchIme = true
+        )
+        try {
+            val s = rt.createSession()
+            val dId = s.displayId
+            s.launch("com.android.chrome")
+            kotlinx.coroutines.delay(3000)
+
+            val dumpPath = "/sdcard/dump_virtual_test.xml"
+            val dumpResult = backend.shell(arrayOf("uiautomator", "dump", "--all", dumpPath))
+            kotlinx.coroutines.delay(1000)
+
+            val xmlContent = try {
+                java.io.File(dumpPath).readText()
+            } catch (e: Throwable) {
+                backend.shell(arrayOf("cat", dumpPath)).stdout
+            }
+
+            val hasDisplayId = xmlContent.contains("""id="$dId"""") || xmlContent.contains("""display id="$dId"""")
+            val hasChrome = xmlContent.contains("com.android.chrome")
+            val preview = xmlContent.take(300).replace("\"", "\\\"").replace("\n", " ")
+
+            s.close()
+            """{"outcome":"VERIFIED","test":"dump_all","displayId":$dId,"dumpSuccess":${dumpResult.exitCode == 0},"hasDisplayId":$hasDisplayId,"hasChrome":$hasChrome,"preview":"$preview"}"""
+        } catch (e: Throwable) {
+            """{"outcome":"FAILED","test":"dump_all","reason":"${esc(e.javaClass.simpleName + ": " + e.message)}"}"""
         } finally {
             rt.close()
         }

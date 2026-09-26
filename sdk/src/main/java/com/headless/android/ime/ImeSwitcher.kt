@@ -51,6 +51,10 @@ class ImeSwitcher(
         val prev = readPrev() ?: return
         try {
             backend.shell(arrayOf("ime", "set", prev))
+            try {
+                // Ensure no phantom keyboard window is left rendered on Display 0
+                backend.shell(arrayOf("input", "keyevent", "111"))
+            } catch (_: Throwable) {}
             HeadlessLog.i(OP, "restored IME=$prev")
         } catch (e: Throwable) {
             HeadlessLog.w(OP, "restore failed for $prev", e)

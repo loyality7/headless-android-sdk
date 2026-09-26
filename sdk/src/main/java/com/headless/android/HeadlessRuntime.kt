@@ -131,11 +131,13 @@ class HeadlessRuntime internal constructor(
                 analyzer = analyzer,
                 ledger = ledger,
                 onEvent = { _events.tryEmit(it) },
-                onClosing = { imeSwitcher?.restore() },
+                onClosing = { /* Display 0 isolation: do NOT restore IME while any session or app is still closing */ },
                 onClosed = { closedSession ->
                     synchronized(lock) {
                         sessions.remove(closedSession)
-                        if (sessions.none { it.isOpen }) imeSwitcher?.restore()
+                        if (sessions.none { it.isOpen }) {
+                            imeSwitcher?.restore()
+                        }
                     }
                 }
             )
