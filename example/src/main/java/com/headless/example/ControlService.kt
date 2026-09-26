@@ -166,6 +166,7 @@ class ControlService : Service() {
     private fun parse(name: String, intent: Intent): AutomationCommand? = when (name.lowercase()) {
         "open", "opensession" -> AutomationCommand.OpenSession
         "close", "closesession" -> AutomationCommand.CloseSession
+        "recover", "recoversession" -> AutomationCommand.RecoverSession
         "observe", "screenshot" -> AutomationCommand.Observe
         "enter", "pressenter" -> AutomationCommand.PressEnter
         "back", "pressback" -> AutomationCommand.PressBack

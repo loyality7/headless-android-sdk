@@ -47,7 +47,7 @@ class HeadlessRuntime internal constructor(
         const val DEFAULT_DENSITY_DPI = 320
     }
 
-    private val stateEngine = StateEngine(privilegeBackend)
+    internal val stateEngine = StateEngine(privilegeBackend)
     private val janitor = DisplayJanitor(privilegeBackend)
     private val ledger = ledgerDir?.let { SessionLedger(it) }
     private val imeSwitcher = headlessImeId?.let { ImeSwitcher(privilegeBackend, ledgerDir, it) }
@@ -77,6 +77,11 @@ class HeadlessRuntime internal constructor(
 
     /** Snapshot of backend identity, liveness and declared capabilities. */
     fun deviceState() = stateEngine.deviceState()
+
+    /** Attempts honest state recovery from persisted checkpoint (#19). */
+    fun recoverSession(checkpointStore: com.headless.android.state.SessionCheckpointStore): com.headless.android.state.RecoveryResult {
+        return com.headless.android.state.SessionRecovery(this, checkpointStore, stateEngine).recover()
+    }
 
     /**
      * Inspects display/IME state for leaks left by earlier runs and repairs what it can.

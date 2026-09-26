@@ -58,6 +58,9 @@ sealed interface AutomationCommand {
 
     /** Capture the current frame and report state. */
     data object Observe : AutomationCommand
+
+    /** Inspects persisted checkpoint and attempts honest state recovery (#19). */
+    data object RecoverSession : AutomationCommand
 }
 
 /**

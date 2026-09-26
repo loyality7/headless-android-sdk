@@ -7,6 +7,9 @@ import com.headless.android.SessionEvent
 import com.headless.android.capture.Screenshot
 import com.headless.android.observation.FrameDiff
 import com.headless.android.observation.WaitOutcome
+import com.headless.android.state.RecoveryResult
+import com.headless.android.state.SessionCheckpoint
+import com.headless.android.state.SessionCheckpointStore
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.FileOutputStream
@@ -39,6 +42,7 @@ class CommandExecutor(
         const val OP = "CommandExecutor"
     }
 
+    val checkpointStore = SessionCheckpointStore(outputDir)
     private var session: HeadlessSession? = null
     private var lastFrame: Screenshot? = null
     private var frameCounter = 0
@@ -94,10 +98,14 @@ class CommandExecutor(
     fun executeOnce(command: AutomationCommand): CommandResult {
         val targetSession = session
         val start = System.currentTimeMillis()
+        checkpointStore.load()?.let {
+            checkpointStore.save(it.copy(pendingAction = command.toString()))
+        }
         val result = try {
             when (command) {
                 AutomationCommand.OpenSession -> openSession(command, start)
                 AutomationCommand.CloseSession -> closeSession(command, start)
+                AutomationCommand.RecoverSession -> recoverSession(command, start)
                 is AutomationCommand.LaunchApp -> launchApp(command, start)
                 is AutomationCommand.StopApp -> stopApp(command, start)
                 AutomationCommand.Observe -> observe(command, start)
@@ -124,6 +132,17 @@ class CommandExecutor(
                 currentPackage = null,
                 durationMs = System.currentTimeMillis() - start
             )
+        }
+        if (result is CommandResult.Verified) {
+            checkpointStore.load()?.let {
+                checkpointStore.save(
+                    it.copy(
+                        lastVerifiedState = result.currentPackage ?: it.lastVerifiedState,
+                        lastCompletedAction = command.toString(),
+                        pendingAction = null
+                    )
+                )
+            }
         }
         val s = session ?: targetSession
         s?.emitEvent(SessionEvent.CommandExecuted(s.id, command, result))
@@ -155,6 +174,16 @@ class CommandExecutor(
         // Verified at state level: the display must actually exist per the platform.
         val state = created.state()
         return if (state.displayAlive) {
+            checkpointStore.save(
+                SessionCheckpoint(
+                    sessionId = created.id,
+                    displayId = created.displayId,
+                    targetPackage = state.currentPackage,
+                    lastVerifiedState = "session_open",
+                    lastCompletedAction = "OpenSession",
+                    pendingAction = null
+                )
+            )
             CommandResult.Verified(
                 command = command,
                 detail = "session=${created.id} display=${created.displayId}",
@@ -174,6 +203,33 @@ class CommandExecutor(
         }
     }
 
+    private fun recoverSession(command: AutomationCommand, start: Long): CommandResult {
+        val recoveryResult = runtime.recoverSession(checkpointStore)
+        return when (recoveryResult) {
+            is RecoveryResult.Recovered -> {
+                session = recoveryResult.session
+                lastFrame = null
+                CommandResult.Verified(
+                    command = command,
+                    detail = recoveryResult.detail,
+                    screenshotPath = captureQuietly(recoveryResult.session)?.let { saveFrame(it, "recovered") },
+                    currentPackage = recoveryResult.session.currentApp(),
+                    changeRatio = null,
+                    durationMs = System.currentTimeMillis() - start
+                )
+            }
+            is RecoveryResult.Unrecoverable -> {
+                CommandResult.Failed(
+                    command = command,
+                    reason = "Session recovery failed honestly: ${recoveryResult.reason}",
+                    screenshotPath = null,
+                    currentPackage = null,
+                    durationMs = System.currentTimeMillis() - start
+                )
+            }
+        }
+    }
+
     private fun closeSession(command: AutomationCommand, start: Long): CommandResult {
         val current = session
             ?: return CommandResult.Verified(
@@ -184,6 +240,7 @@ class CommandExecutor(
         current.close()
         session = null
         lastFrame = null
+        checkpointStore.clear()
         return CommandResult.Verified(
             command = command,
             detail = "closed session ${current.id}, released display $displayId",
@@ -200,6 +257,16 @@ class CommandExecutor(
         Thread.sleep(postActionDelayMs)
         val frame = captureQuietly(s)
         val pkg = s.currentApp()
+        checkpointStore.save(
+            SessionCheckpoint(
+                sessionId = s.id,
+                displayId = s.displayId,
+                targetPackage = command.packageName,
+                lastVerifiedState = pkg ?: command.packageName,
+                lastCompletedAction = "LaunchApp(${command.packageName})",
+                pendingAction = null
+            )
+        )
         // State verification: the launcher already confirmed a task on our display.
         return CommandResult.Verified(
             command = command,
