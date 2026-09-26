@@ -19,13 +19,19 @@ object HeadlessAutomation {
     /**
      * Starts the runtime with the given (or default on-device [ShizukuBackend]).
      */
-    fun start(context: Context, backend: PrivilegeBackend = ShizukuBackend()): HeadlessRuntime {
+    fun start(
+        context: Context,
+        backend: PrivilegeBackend = ShizukuBackend(),
+        maxSessions: Int = 1,
+        autoSwitchIme: Boolean = true
+    ): HeadlessRuntime {
         val pkg = context.packageName
         return HeadlessRuntime(
             backend,
             ledgerDir = java.io.File(context.filesDir, "headless"),
             headlessImeId = "$pkg/com.headless.android.ime.HeadlessImeService",
-            autoSwitchIme = true
+            maxSessions = maxSessions,
+            autoSwitchIme = autoSwitchIme
         )
     }
 }

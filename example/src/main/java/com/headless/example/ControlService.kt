@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -109,6 +110,11 @@ class ControlService : Service() {
                         """{"cmd":"ime_readback","bindCount":${ime.bindCount},""" +
                             """ "snapshot":"${esc(ime.snapshot())}"}"""
                     )
+                    return@launch
+                }
+                if (cmdName.equals("test_multisession", ignoreCase = true)) {
+                    val report = runMultiSessionAudit()
+                    writeLine(report)
                     return@launch
                 }
                 val command = parse(cmdName, intent)
@@ -282,6 +288,67 @@ class ControlService : Service() {
         val f = File(outputDir, "results.jsonl")
         if (f.exists()) f.appendText("\n$line") else f.writeText(line)
         android.util.Log.i("HeadlessControl", line)
+    }
+
+    private suspend fun runMultiSessionAudit(): String = withContext(Dispatchers.IO) {
+        val backend = com.headless.android.privilege.ShizukuBackend()
+        backend.awaitAvailable()
+        if (!backend.isAuthorized()) {
+            backend.requestAuthorization()
+        }
+        if (!backend.isAuthorized()) {
+            return@withContext """{"outcome":"FAILED","test":"multisession","reason":"backend not authorized"}"""
+        }
+        val rt = HeadlessAutomation.start(
+            context = applicationContext,
+            backend = backend,
+            maxSessions = 2,
+            autoSwitchIme = true
+        )
+        try {
+            // 1. Create two sessions
+            val s1 = rt.createSession()
+            val s2 = rt.createSession()
+            val d1 = s1.displayId
+            val d2 = s2.displayId
+
+            // 2. Launch distinct apps on each
+            s1.launch("com.android.chrome")
+            s2.launch("com.android.settings")
+            kotlinx.coroutines.delay(3000)
+
+            val p1 = s1.currentApp()
+            val p2 = s2.currentApp()
+
+            // 3. Capture frames independently
+            val f1 = s1.screenshot()
+            val f2 = s2.screenshot()
+            val f1Size = f1.width * f1.height
+            val f2Size = f2.width * f2.height
+
+            // 4. Test input routing to s1
+            s1.tap(500f, 500f)
+            kotlinx.coroutines.delay(500)
+
+            // 5. Close s1, verify s2 remains alive
+            s1.close()
+            val s1OpenAfterClose = s1.isOpen
+            val s2OpenAfterS1Close = s2.isOpen && s2.state().displayAlive
+
+            // 6. Close s2
+            s2.close()
+            val s2OpenAfterClose = s2.isOpen
+
+            // 7. Verify no leaked non-default displays
+            val cleanupReport = rt.cleanUpStaleState()
+            val leaks = cleanupReport.nonDefaultDisplayIds
+
+            """{"outcome":"VERIFIED","test":"multisession","d1":$d1,"d2":$d2,"p1":"$p1","p2":"$p2","f1Size":$f1Size,"f2Size":$f2Size,"s1Closed":${!s1OpenAfterClose},"s2Survived":$s2OpenAfterS1Close,"s2Closed":${!s2OpenAfterClose},"leakedDisplays":${leaks.size}}"""
+        } catch (e: Throwable) {
+            """{"outcome":"FAILED","test":"multisession","reason":"${esc(e.javaClass.simpleName + ": " + e.message)}"}"""
+        } finally {
+            rt.close()
+        }
     }
 
     override fun onDestroy() {

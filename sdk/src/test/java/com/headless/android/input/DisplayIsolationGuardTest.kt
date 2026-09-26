@@ -168,4 +168,40 @@ Display #42 (activities from top to bottom):
 
         guard.validateKeyInjection("type", "com.android.chrome")
     }
+
+    @Test
+    fun `multi-display isolation guards check respective displays independently`() {
+        val multiDisplayStdout = """
+Display #25 (activities from top to bottom):
+  * Task{aaa #1 type=standard A=10193:com.android.chrome U=0 visible=true}
+    topResumedActivity=ActivityRecord{h1 u0 com.android.chrome/.Main t1}
+Display #26 (activities from top to bottom):
+  * Task{bbb #2 type=standard A=1000:com.android.settings U=0 visible=true}
+    topResumedActivity=ActivityRecord{h2 u0 com.android.settings/.Main t2}
+        """.trimIndent()
+
+        fakeBackend.activityActivitiesStdout = multiDisplayStdout
+        fakeBackend.windowDisplaysStdout = "mImeShowing=false"
+
+        val guard1 = DisplayIsolationGuard(fakeBackend, displayId = 25, displayWidth = 1080, displayHeight = 1920)
+        val guard2 = DisplayIsolationGuard(fakeBackend, displayId = 26, displayWidth = 1080, displayHeight = 1920)
+
+        // Guard 1 verifies display 25
+        guard1.validateKeyInjection("type", "com.android.chrome")
+        try {
+            guard1.validateKeyInjection("type", "com.android.settings")
+            fail("Guard 1 should reject com.android.settings since it is not top on display 25")
+        } catch (e: DisplayIsolationViolationException) {
+            assertTrue(e.reason.contains("com.android.settings"))
+        }
+
+        // Guard 2 verifies display 26
+        guard2.validateKeyInjection("type", "com.android.settings")
+        try {
+            guard2.validateKeyInjection("type", "com.android.chrome")
+            fail("Guard 2 should reject com.android.chrome since it is not top on display 26")
+        } catch (e: DisplayIsolationViolationException) {
+            assertTrue(e.reason.contains("com.android.chrome"))
+        }
+    }
 }
