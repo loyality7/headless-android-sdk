@@ -27,6 +27,7 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
         private const val FLAG_OWN_CONTENT_ONLY = 1 shl 3 // DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
         private const val FLAG_SUPPORTS_TOUCH = 1 shl 6   // DisplayManager.VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH
         private const val FLAG_TRUSTED = 1 shl 10         // DisplayManager.VIRTUAL_DISPLAY_FLAG_TRUSTED
+        private const val FLAG_ALWAYS_UNLOCKED = 1 shl 12 // DisplayManager.VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED
 
         private const val INTERFACE_TOKEN = "android.hardware.display.IDisplayManager"
         private const val CALLING_PACKAGE = "com.android.shell"
@@ -51,7 +52,7 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
         try {
             val displayBinder = privilegeBackend.getSystemServiceBinder("display")
 
-            val flags = FLAG_TRUSTED or FLAG_OWN_CONTENT_ONLY or FLAG_SUPPORTS_TOUCH
+            val flags = FLAG_TRUSTED or FLAG_OWN_CONTENT_ONLY or FLAG_SUPPORTS_TOUCH or FLAG_ALWAYS_UNLOCKED
             HeadlessLog.i(OP, "VirtualDisplay REQUESTED: name=$name width=$width height=$height densityDpi=$densityDpi flags=0x${Integer.toHexString(flags)}")
             val config = VirtualDisplayConfig.Builder(name, width, height, densityDpi)
                 .setFlags(flags)

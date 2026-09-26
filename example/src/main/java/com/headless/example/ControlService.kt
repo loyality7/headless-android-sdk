@@ -54,10 +54,17 @@ class ControlService : Service() {
         File(getExternalFilesDir(null) ?: cacheDir, "control").apply { mkdirs() }
     }
 
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        val pm = getSystemService(android.os.PowerManager::class.java)
+        wakeLock = pm?.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "headless:automation_session")?.apply {
+            setReferenceCounted(false)
+            acquire()
+        }
         // MUST become a real foreground service, not merely be *started* as one.
         // Observed failure: started via `am start-foreground-service` but without calling
         // startForeground(), Android dropped this process to the cached bucket as soon as a
@@ -278,6 +285,9 @@ class ControlService : Service() {
     }
 
     override fun onDestroy() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Throwable) {}
         super.onDestroy()
         // Deliberately NOT shutting down Hub here: instance churn (system destroying +
         // recreating this service in the same process) must not kill the live session —
