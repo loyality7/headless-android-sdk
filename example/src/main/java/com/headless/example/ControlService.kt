@@ -218,12 +218,24 @@ class ControlService : Service() {
     }
 
     private fun parsePolicy(intent: Intent): com.headless.android.command.RetryPolicy {
-        // ponytail: 3 extras only, defaults = single-shot (old behavior).
+        val recoveryStr = intent.getStringExtra("recovery")?.lowercase()
+        val recovery = when {
+            recoveryStr == "clear" || recoveryStr == "cleartext" ->
+                com.headless.android.command.RecoveryStrategy.ClearFieldBeforeRetry
+            recoveryStr == "dismiss" || recoveryStr == "back" ->
+                com.headless.android.command.RecoveryStrategy.DismissBeforeRetry
+            recoveryStr?.startsWith("delete:") == true -> {
+                val n = recoveryStr.substringAfter("delete:").toIntOrNull() ?: 1
+                com.headless.android.command.RecoveryStrategy.DeleteCharsBeforeRetry(n)
+            }
+            else -> com.headless.android.command.RecoveryStrategy.None
+        }
         return com.headless.android.command.RetryPolicy(
             maxAttempts = intent.getIntExtra("attempts", 1).coerceIn(1, 5),
             backoffMs = intent.getLongExtra("backoff", 500L),
             retryOnUncertain = intent.getBooleanExtra("retryUncertain", true),
-            allowDestructive = intent.getBooleanExtra("confirm", false)
+            allowDestructive = intent.getBooleanExtra("confirm", false),
+            recovery = recovery
         )
     }
 

@@ -75,6 +75,16 @@ class CommandExecutor(
                 return result
             }
             HeadlessLog.d(OP, "$command attempt=$attempt/${policy.maxAttempts} -> $result, retrying")
+
+            Transaction.recoveryCommand(policy.recovery)?.let { recCmd ->
+                HeadlessLog.i(OP, "Executing recovery before retry attempt ${attempt + 1}: $recCmd")
+                try {
+                    executeOnce(recCmd)
+                } catch (e: Throwable) {
+                    HeadlessLog.w(OP, "Recovery command $recCmd threw", e)
+                }
+            }
+
             if (policy.backoffMs > 0) Thread.sleep(policy.backoffMs * attempt)
         }
         return last!!

@@ -43,4 +43,25 @@ class TransactionTest {
         assertFalse(RetryPolicy.isDestructive(AutomationCommand.PressEnter))
         assertFalse(RetryPolicy.isDestructive(AutomationCommand.TypeText("hi")))
     }
+
+    @Test fun `recoveryCommand maps recovery strategies to expected automation commands`() {
+        org.junit.Assert.assertNull(Transaction.recoveryCommand(RecoveryStrategy.None))
+        org.junit.Assert.assertEquals(
+            AutomationCommand.ClearText,
+            Transaction.recoveryCommand(RecoveryStrategy.ClearFieldBeforeRetry)
+        )
+        org.junit.Assert.assertEquals(
+            AutomationCommand.DeleteText(4),
+            Transaction.recoveryCommand(RecoveryStrategy.DeleteCharsBeforeRetry(4))
+        )
+        org.junit.Assert.assertEquals(
+            AutomationCommand.PressBack,
+            Transaction.recoveryCommand(RecoveryStrategy.DismissBeforeRetry)
+        )
+        val custom = AutomationCommand.PressTab
+        org.junit.Assert.assertEquals(
+            custom,
+            Transaction.recoveryCommand(RecoveryStrategy.Custom(custom))
+        )
+    }
 }

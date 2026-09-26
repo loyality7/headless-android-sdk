@@ -9,12 +9,37 @@ sealed interface Expect {
     data class Package(val name: String) : Expect
 }
 
+/**
+ * Action to perform before retrying a failed or uncertain command.
+ *
+ * For example, if typing text fails or needs to be retried, [ClearFieldBeforeRetry]
+ * clears the focused field with [AutomationCommand.ClearText] so retrying [AutomationCommand.TypeText]
+ * doesn't append duplicate text to an already partially typed field.
+ */
+sealed interface RecoveryStrategy {
+    data object None : RecoveryStrategy
+
+    /** Clears the currently focused text field before retrying. */
+    data object ClearFieldBeforeRetry : RecoveryStrategy
+
+    /** Deletes [count] characters backwards from cursor before retrying. */
+    data class DeleteCharsBeforeRetry(val count: Int) : RecoveryStrategy
+
+    /** Dismisses modal/dialog (e.g. Back key) before retrying. */
+    data object DismissBeforeRetry : RecoveryStrategy
+
+    /** Custom recovery command. */
+    data class Custom(val command: AutomationCommand) : RecoveryStrategy
+}
+
 data class RetryPolicy(
     val maxAttempts: Int = 3,
     val backoffMs: Long = 500L,
     val retryOnUncertain: Boolean = true,
     /** Destructive cmds (DeleteText/ClearText) refuse unless true. Default deny. */
-    val allowDestructive: Boolean = false
+    val allowDestructive: Boolean = false,
+    /** Recovery action executed before each retry attempt. Defaults to None. */
+    val recovery: RecoveryStrategy = RecoveryStrategy.None
 ) {
     companion object {
         /** Commands that destroy user data with no undo. PressEnter/SEND excluded:
@@ -63,5 +88,13 @@ object Transaction {
         if (result is CommandResult.Uncertain && policy.retryOnUncertain && expect == Expect.None) return true
         if (result is CommandResult.Failed) return isRetryableFailure(result.reason)
         return false
+    }
+
+    fun recoveryCommand(strategy: RecoveryStrategy): AutomationCommand? = when (strategy) {
+        is RecoveryStrategy.None -> null
+        is RecoveryStrategy.ClearFieldBeforeRetry -> AutomationCommand.ClearText
+        is RecoveryStrategy.DeleteCharsBeforeRetry -> AutomationCommand.DeleteText(strategy.count)
+        is RecoveryStrategy.DismissBeforeRetry -> AutomationCommand.PressBack
+        is RecoveryStrategy.Custom -> strategy.command
     }
 }
