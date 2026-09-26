@@ -15,7 +15,11 @@ import com.headless.android.observation.ScreenFrame
 import com.headless.android.observation.StabilityPolicy
 import com.headless.android.observation.WaitEngine
 import com.headless.android.observation.WaitOutcome
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import com.headless.android.perception.PerceptionEngine
 import com.headless.android.perception.ScreenAnalyzer
 import com.headless.android.perception.ScreenElement
@@ -39,6 +43,7 @@ class HeadlessSession internal constructor(
     displayDensityDpi: Int,
     val analyzer: ScreenAnalyzer = PerceptionEngine(),
     private val ledger: com.headless.android.state.SessionLedger? = null,
+    private val onEvent: (SessionEvent) -> Unit = {},
     /**
      * Runs at the START of [close], before the app is stopped and the display released.
      * Used to restore the user's keyboard while the display still exists: releasing a
@@ -51,12 +56,53 @@ class HeadlessSession internal constructor(
 ) {
     val id: String = UUID.randomUUID().toString()
 
+    private val _events = MutableSharedFlow<SessionEvent>(
+        replay = 16,
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
+    /** Real-time event stream for this session. */
+    val events: SharedFlow<SessionEvent> = _events.asSharedFlow()
+
+    internal fun emitEvent(event: SessionEvent) {
+        _events.tryEmit(event)
+        try {
+            onEvent(event)
+        } catch (e: Throwable) {
+            HeadlessLog.w("HeadlessSession", "onEvent callback threw", e)
+        }
+    }
+
     private val displayManager = VirtualDisplayManager(privilegeBackend)
 
     private val display: HeadlessDisplay =
         displayManager.createTrustedDisplay(displayWidth, displayHeight, displayDensityDpi)
 
     val displayId: Int get() = display.displayId
+
+    private val deadListener: () -> Unit = {
+        emitEvent(
+            SessionEvent.BackendLost(
+                sessionId = id,
+                backendName = privilegeBackend.name,
+                reason = "Privilege backend service binder died unexpectedly"
+            )
+        )
+    }
+
+    init {
+        privilegeBackend.addOnDeadListener(deadListener)
+        emitEvent(
+            SessionEvent.DisplayCreated(
+                sessionId = id,
+                displayId = display.displayId,
+                width = displayWidth,
+                height = displayHeight,
+                densityDpi = displayDensityDpi
+            )
+        )
+    }
 
     val isolationGuard = DisplayIsolationGuard(
         privilegeBackend = privilegeBackend,
@@ -96,15 +142,69 @@ class HeadlessSession internal constructor(
 
     val isOpen: Boolean get() = !closed
 
+    private var lastState: SessionState? = null
+
     /** Live snapshot of this session's state, queried from the platform. */
-    fun state(): SessionState = stateEngine.sessionState(id, display.displayId, !closed)
+    fun state(): SessionState {
+        val s = stateEngine.sessionState(id, display.displayId, !closed)
+        if (s != lastState) {
+            emitEvent(SessionEvent.StateChanged(id, s))
+            lastState = s
+        }
+        return s
+    }
+
+    private inline fun <T> trackAction(actionName: String, block: () -> T): T {
+        emitEvent(SessionEvent.ActionStarted(id, actionName, display.displayId))
+        val start = System.currentTimeMillis()
+        return try {
+            val result = block()
+            emitEvent(
+                SessionEvent.ActionCompleted(
+                    sessionId = id,
+                    action = actionName,
+                    displayId = display.displayId,
+                    success = true,
+                    durationMs = System.currentTimeMillis() - start,
+                    outcome = "success"
+                )
+            )
+            result
+        } catch (e: Throwable) {
+            if (e is DisplayIsolationViolationException) {
+                emitEvent(
+                    SessionEvent.IsolationViolation(
+                        sessionId = id,
+                        action = actionName,
+                        reason = e.message ?: "Display isolation violation",
+                        displayId = display.displayId
+                    )
+                )
+            }
+            emitEvent(
+                SessionEvent.ActionCompleted(
+                    sessionId = id,
+                    action = actionName,
+                    displayId = display.displayId,
+                    success = false,
+                    durationMs = System.currentTimeMillis() - start,
+                    error = e.message ?: e.javaClass.simpleName,
+                    outcome = "failed"
+                )
+            )
+            throw e
+        }
+    }
 
     fun launch(packageName: String, uri: Uri? = null) {
         checkOpen()
-        appLauncher.launch(packageName, display.displayId, uri)
-        launchedPackage = packageName
-        inputAllowed = true
-        ledger?.record(id, display.displayId, packageName)
+        trackAction("launch($packageName)") {
+            appLauncher.launch(packageName, display.displayId, uri)
+            launchedPackage = packageName
+            inputAllowed = true
+            ledger?.record(id, display.displayId, packageName)
+            emitEvent(SessionEvent.AppLaunched(id, packageName, display.displayId))
+        }
     }
 
     /**
@@ -138,6 +238,14 @@ class HeadlessSession internal constructor(
         val hosting = appLauncher.displayIdsHosting(pkg)
         if (!hosting.contains(display.displayId)) {
             inputAllowed = false
+            emitEvent(
+                SessionEvent.AppCrashed(
+                    sessionId = id,
+                    packageName = pkg,
+                    displayId = display.displayId,
+                    reason = "App is no longer hosted on display ${display.displayId} (found on ${hosting.sorted().ifEmpty { "no display" }})"
+                )
+            )
             throw InputInjectionException(
                 "Refusing $action: '$pkg' is not on this session's display ${display.displayId} " +
                     "(currently on ${hosting.sorted().ifEmpty { "no display" }}). Injecting now could " +
@@ -152,14 +260,30 @@ class HeadlessSession internal constructor(
     /** Probes Display 0 to verify it has not been contaminated (e.g. keyboard showing on Display 0). */
     fun checkDisplayZero(): DisplayIsolationGuard.DisplayZeroStatus {
         checkOpen()
-        return isolationGuard.probeDisplayZero()
+        val status = isolationGuard.probeDisplayZero()
+        if (status.isContaminated || status.imeShowingOnDisplayZero) {
+            emitEvent(
+                SessionEvent.ContaminationAlert(
+                    sessionId = id,
+                    detail = status.detail,
+                    displayZeroPackage = status.topActivityOnDisplayZero
+                )
+            )
+        }
+        return status
     }
 
     /** Force-stops [packageName]. Returns true if the stop command completed cleanly. */
     fun stopApp(packageName: String): Boolean {
         checkOpen()
-        ledger?.clear()
-        return appLauncher.stop(packageName)
+        return trackAction("stopApp($packageName)") {
+            ledger?.clear()
+            val stopped = appLauncher.stop(packageName)
+            if (stopped) {
+                emitEvent(SessionEvent.AppStopped(id, packageName, display.displayId))
+            }
+            stopped
+        }
     }
 
     /** Package name of the top resumed activity on this session's display, or null if none. */
@@ -176,7 +300,9 @@ class HeadlessSession internal constructor(
 
     fun tap(x: Float, y: Float) {
         checkInputAllowed("tap")
-        inputController.tap(x, y)
+        trackAction("tap($x, $y)") {
+            inputController.tap(x, y)
+        }
     }
 
     /** Analyzes the current screen and returns a structured [ScreenObservation]. */
@@ -235,39 +361,53 @@ class HeadlessSession internal constructor(
 
     fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long) {
         checkInputAllowed("swipe")
-        inputController.swipe(x1, y1, x2, y2, durationMs)
+        trackAction("swipe($x1, $y1 -> $x2, $y2)") {
+            inputController.swipe(x1, y1, x2, y2, durationMs)
+        }
     }
 
     fun type(text: String) {
         checkInputAllowed("type")
-        inputController.type(text)
+        trackAction("type") {
+            inputController.type(text)
+        }
     }
 
     fun pressEnter() {
         checkInputAllowed("pressEnter")
-        inputController.pressEnter()
+        trackAction("pressEnter") {
+            inputController.pressEnter()
+        }
     }
 
     fun pressBack() {
         checkInputAllowed("pressBack")
-        inputController.pressBack()
+        trackAction("pressBack") {
+            inputController.pressBack()
+        }
     }
 
     fun pressTab() {
         checkInputAllowed("pressTab")
-        inputController.pressTab()
+        trackAction("pressTab") {
+            inputController.pressTab()
+        }
     }
 
     /** Deletes [count] characters backwards from the cursor. */
     fun deleteText(count: Int) {
         checkInputAllowed("deleteText")
-        inputController.deleteText(count)
+        trackAction("deleteText($count)") {
+            inputController.deleteText(count)
+        }
     }
 
     /** Clears the focused field (select-all then delete). */
     fun clearText() {
         checkInputAllowed("clearText")
-        inputController.clearText()
+        trackAction("clearText") {
+            inputController.clearText()
+        }
     }
 
     fun screenshot(): Screenshot {
@@ -352,6 +492,11 @@ class HeadlessSession internal constructor(
         synchronized(closeLock) {
         if (closed) return
         closed = true
+        emitEvent(SessionEvent.SessionClosing(id, display.displayId))
+        try {
+            privilegeBackend.removeOnDeadListener(deadListener)
+        } catch (_: Throwable) {}
+
         try { onClosing() } catch (_: Throwable) {}
         ledger?.clear()
 
@@ -360,6 +505,7 @@ class HeadlessSession internal constructor(
         launchedPackage?.let { pkg ->
             try {
                 appLauncher.stop(pkg)
+                emitEvent(SessionEvent.AppStopped(id, pkg, display.displayId))
                 // Small grace period to allow WindowManager to finalize window cleanup
                 Thread.sleep(200)
             } catch (e: Throwable) {
@@ -375,6 +521,7 @@ class HeadlessSession internal constructor(
 
         try {
             display.release()
+            emitEvent(SessionEvent.DisplayReleased(id, display.displayId))
         } catch (e: Throwable) {
             failure = e
             HeadlessLog.e("HeadlessSession", "failed releasing display ${display.displayId}", e)
@@ -386,6 +533,8 @@ class HeadlessSession internal constructor(
             op = "HeadlessSession.close",
             success = failure == null
         )
+
+        emitEvent(SessionEvent.SessionClosed(id, display.displayId))
 
         onClosed(this)
 

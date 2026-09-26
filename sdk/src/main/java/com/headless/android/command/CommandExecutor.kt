@@ -3,6 +3,7 @@ package com.headless.android.command
 import com.headless.android.HeadlessLog
 import com.headless.android.HeadlessRuntime
 import com.headless.android.HeadlessSession
+import com.headless.android.SessionEvent
 import com.headless.android.capture.Screenshot
 import com.headless.android.observation.FrameDiff
 import com.headless.android.observation.WaitOutcome
@@ -91,8 +92,9 @@ class CommandExecutor(
     }
 
     fun executeOnce(command: AutomationCommand): CommandResult {
+        val targetSession = session
         val start = System.currentTimeMillis()
-        return try {
+        val result = try {
             when (command) {
                 AutomationCommand.OpenSession -> openSession(command, start)
                 AutomationCommand.CloseSession -> closeSession(command, start)
@@ -123,6 +125,9 @@ class CommandExecutor(
                 durationMs = System.currentTimeMillis() - start
             )
         }
+        val s = session ?: targetSession
+        s?.emitEvent(SessionEvent.CommandExecuted(s.id, command, result))
+        return result
     }
 
     private fun requireSession(): HeadlessSession =

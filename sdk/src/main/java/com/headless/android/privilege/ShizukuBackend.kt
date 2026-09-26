@@ -46,6 +46,8 @@ class ShizukuBackend : PrivilegeBackend {
     @Volatile
     private var binderAlive: Boolean = false
 
+    private val deadListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
         binderAlive = true
         HeadlessLog.i(OP, "Shizuku binder received from service")
@@ -54,6 +56,15 @@ class ShizukuBackend : PrivilegeBackend {
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
         binderAlive = false
         HeadlessLog.w(OP, "Shizuku binder died / service killed")
+        deadListeners.forEach { try { it() } catch (_: Throwable) {} }
+    }
+
+    override fun addOnDeadListener(listener: () -> Unit) {
+        deadListeners.add(listener)
+    }
+
+    override fun removeOnDeadListener(listener: () -> Unit) {
+        deadListeners.remove(listener)
     }
 
     init {

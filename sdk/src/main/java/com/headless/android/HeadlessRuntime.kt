@@ -6,6 +6,10 @@ import com.headless.android.privilege.PrivilegeBackend
 import com.headless.android.state.DisplayJanitor
 import com.headless.android.state.SessionLedger
 import com.headless.android.state.StateEngine
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import com.headless.android.ime.ImeSwitcher
 
 /**
@@ -49,6 +53,15 @@ class HeadlessRuntime internal constructor(
     private val imeSwitcher = headlessImeId?.let { ImeSwitcher(privilegeBackend, ledgerDir, it) }
     private val sessions = mutableListOf<HeadlessSession>()
     private val lock = Any()
+
+    private val _events = MutableSharedFlow<SessionEvent>(
+        replay = 16,
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
+    /** Aggregated real-time event stream across all sessions owned by this runtime. */
+    val events: SharedFlow<SessionEvent> = _events.asSharedFlow()
 
     @Volatile
     private var closed = false
@@ -112,6 +125,7 @@ class HeadlessRuntime internal constructor(
                 displayDensityDpi = densityDpi,
                 analyzer = analyzer,
                 ledger = ledger,
+                onEvent = { _events.tryEmit(it) },
                 onClosing = { imeSwitcher?.restore() },
                 onClosed = { closedSession ->
                     synchronized(lock) {
@@ -127,7 +141,6 @@ class HeadlessRuntime internal constructor(
                     "headless IME switch failed — text focus may crash Gboard (#1); non-text automation unaffected"
                 )
             }
-            sessions.add(session)
             HeadlessLog.event(
                 sessionId = session.id,
                 displayId = session.displayId,

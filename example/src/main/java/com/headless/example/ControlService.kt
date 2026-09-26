@@ -146,6 +146,13 @@ class ControlService : Service() {
         }
         Hub.runtime = rt
 
+        scope.launch {
+            rt.events.collect { event ->
+                Log.i("SessionEvent", "STREAM: $event")
+                writeLine("""{"session_event":"${event.javaClass.simpleName}","timestamp":${event.timestampMs},"detail":"${esc(event.toString())}"}""")
+            }
+        }
+
         // A previous runtime may have been killed (OEM task cleaner / LMKD) without
         // running its own cleanup, leaving live virtual displays and stale IME records
         // that make the user's physical keyboard misbehave. Report and repair first.

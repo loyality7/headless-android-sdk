@@ -118,4 +118,10 @@ interface PrivilegeBackend {
 
     /** Releases any held resources (listeners, connections). Safe to call multiple times. */
     fun close()
+
+    /** Registers a callback invoked if the privilege transport dies. */
+    fun addOnDeadListener(listener: () -> Unit) {}
+
+    /** Unregisters a callback. */
+    fun removeOnDeadListener(listener: () -> Unit) {}
 }
