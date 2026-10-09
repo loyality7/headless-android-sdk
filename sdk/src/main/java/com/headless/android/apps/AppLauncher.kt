@@ -38,6 +38,17 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
      * place it on that display.
      */
     fun launch(packageName: String, displayId: Int, uri: Uri? = null) {
+        // Fail closed BEFORE any binder call: if the target display is display 0 or is not
+        // alive, the platform would fall back to display 0 and the app would open on the
+        // user's physical screen.
+        if (displayId <= 0) {
+            throw AppLaunchException(packageName, "Refusing to launch on display $displayId: display 0 is the user's physical screen")
+        }
+        if (!isDisplayAlive(displayId)) {
+            throw AppLaunchException(packageName, "Refusing to launch: display $displayId does not exist (launching would fall back to display 0)")
+        }
+        val wasOnDisplayZero = displayIdsHosting(packageName).contains(0)
+
         val component = resolveMainComponent(packageName)
             ?: throw AppLaunchException(packageName, "Could not resolve a launchable activity")
 
@@ -71,6 +82,12 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
         // safety-critical case: the app may be on the user's physical display, where any
         // subsequent input injection would hit the real screen.
         val elsewhere = lastSeenOn - displayId
+        // The app landed on the user's screen because of this launch: take it off again
+        // rather than leaving it there. Skipped when the user already had it open on
+        // display 0 — then we cannot tell which task is ours and must not kill theirs.
+        if (0 in elsewhere && !wasOnDisplayZero) {
+            removeFromDisplay(packageName, 0)
+        }
         val detail = when {
             elsewhere.isEmpty() ->
                 "not observed on any display within ${VERIFY_ATTEMPTS * VERIFY_DELAY_MS}ms"
@@ -128,19 +145,62 @@ class AppLauncher(private val privilegeBackend: PrivilegeBackend) {
         }
     }
 
-    /** Force-stops [packageName] and waits until its tasks are removed from the system. */
-    fun stop(packageName: String): Boolean {
-        val result = privilegeBackend.shell(arrayOf("am", "force-stop", packageName))
-        // Wait up to 1.5 seconds for ActivityTaskManager to tear down all tasks
+    /**
+     * Closes [packageName]'s tasks on [displayId] only, leaving the same app on any other
+     * display (the user's own copy on display 0) untouched. A global `am force-stop` here
+     * killed the user's real app.
+     *
+     * Falls back to force-stop only when the app has no presence on display 0, so nothing
+     * of the user's can be lost. Returns true once the app is gone from [displayId].
+     */
+    fun closeOnDisplay(packageName: String, displayId: Int): Boolean {
+        removeFromDisplay(packageName, displayId)
         repeat(15) {
-            if (displayIdsHosting(packageName).isEmpty()) {
-                HeadlessLog.event(packageName = packageName, op = "$OP.stop", success = true)
+            if (!displayIdsHosting(packageName).contains(displayId)) {
+                HeadlessLog.event(displayId = displayId, packageName = packageName, op = "$OP.close", success = true)
                 return true
             }
             Thread.sleep(100)
         }
-        HeadlessLog.event(packageName = packageName, op = "$OP.stop", success = result.isSuccess)
-        return result.isSuccess
+        if (!displayIdsHosting(packageName).contains(0)) {
+            privilegeBackend.shell(arrayOf("am", "force-stop", packageName))
+            Thread.sleep(300)
+        }
+        val gone = !displayIdsHosting(packageName).contains(displayId)
+        HeadlessLog.event(displayId = displayId, packageName = packageName, op = "$OP.close", success = gone)
+        return gone
+    }
+
+    /**
+     * Cleanup for an orphaned session app whose display is gone. Force-stops it only if it
+     * is NOT on display 0 — if it is there we cannot prove it is ours rather than the
+     * user's own instance, so it is left alone.
+     */
+    fun reapOrphan(packageName: String): Boolean {
+        if (displayIdsHosting(packageName).contains(0)) {
+            HeadlessLog.w(OP, "orphan $packageName is on display 0; leaving it (may be the user's own)")
+            return false
+        }
+        privilegeBackend.shell(arrayOf("am", "force-stop", packageName))
+        return true
+    }
+
+    /** Root task ids [packageName] currently has on [displayId] (what the display guard removes). */
+    fun taskIdsOnDisplay(packageName: String, displayId: Int): List<Int> {
+        val dump = privilegeBackend.shell(arrayOf("dumpsys", "activity", "activities")).stdout
+        return ActivityDumpParser.rootTaskIdsOnDisplay(dump, displayId, packageName)
+    }
+
+    private fun removeFromDisplay(packageName: String, displayId: Int) {
+        val dump = privilegeBackend.shell(arrayOf("dumpsys", "activity", "activities")).stdout
+        for (taskId in ActivityDumpParser.rootTaskIdsOnDisplay(dump, displayId, packageName)) {
+            privilegeBackend.shell(arrayOf("am", "stack", "remove", taskId.toString()))
+        }
+    }
+
+    private fun isDisplayAlive(displayId: Int): Boolean {
+        val out = privilegeBackend.shell(arrayOf("dumpsys", "display")).stdout
+        return Regex("""mDisplayId=$displayId\b""").containsMatchIn(out)
     }
 
     /**

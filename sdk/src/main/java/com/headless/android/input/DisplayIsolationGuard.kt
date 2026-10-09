@@ -43,6 +43,10 @@ class DisplayIsolationGuard(
 
     /**
      * Report describing current Display 0 contamination status.
+     *
+     * [imeShowingOnDisplayZero] is raw visibility (any keyboard, including the user's own).
+     * [isContaminated] is the one to act on: it is true only for a keyboard that serves a
+     * window on another display, i.e. a real leak from automation.
      */
     data class DisplayZeroStatus(
         val imeShowingOnDisplayZero: Boolean,
@@ -187,7 +191,9 @@ class DisplayIsolationGuard(
             ""
         }
 
-        if (windowDump.isNotEmpty() && isDisplayZeroImeShowing(windowDump)) {
+        if (windowDump.isNotEmpty() && isDisplayZeroImeShowing(windowDump) &&
+            ImeOwnership.isAutomationKeyboard(imeClient())
+        ) {
             throw DisplayIsolationViolationException(
                 reason = "Display 0 currently has an active soft keyboard showing; refusing $action to prevent key leakage",
                 displayId = displayId,
@@ -211,7 +217,11 @@ class DisplayIsolationGuard(
             )
         }
 
-        val imeShowing = isDisplayZeroImeShowing(windowDump)
+        val imeVisible = isDisplayZeroImeShowing(windowDump)
+        // A keyboard on display 0 is only a leak if it serves a window on another display.
+        // The user opening their own keyboard in an app on display 0 is not.
+        val client = if (imeVisible) imeClient() else null
+        val leak = imeVisible && ImeOwnership.isAutomationKeyboard(client)
 
         val activitiesDump = try {
             privilegeBackend.shell(arrayOf("dumpsys", "activity", "activities")).stdout
@@ -220,19 +230,27 @@ class DisplayIsolationGuard(
         }
         val displayZeroPkg = ActivityDumpParser.foregroundPackageOnDisplay(activitiesDump, 0)
 
-        val isContaminated = imeShowing
-        val detail = if (imeShowing) {
-            "CRITICAL: Soft keyboard (IME) is showing on Display 0!"
-        } else {
-            "Display 0 is clean (topActivity=$displayZeroPkg, imeShowing=false)"
+        val detail = when {
+            leak -> "CRITICAL: the soft keyboard on Display 0 serves a window on display " +
+                "${client?.displayId ?: "unknown"} (automation), not an app on Display 0"
+            imeVisible -> "A keyboard is open on Display 0 for the user's own app " +
+                "(uid ${client?.uid}); not an automation leak"
+            else -> "Display 0 is clean (topActivity=$displayZeroPkg, imeShowing=false)"
         }
 
         return DisplayZeroStatus(
-            imeShowingOnDisplayZero = imeShowing,
+            imeShowingOnDisplayZero = imeVisible,
             topActivityOnDisplayZero = displayZeroPkg,
-            isContaminated = isContaminated,
+            isContaminated = leak,
             detail = detail
         )
+    }
+
+    private fun imeClient(): ImeClient? = try {
+        ImeOwnership.currentClient(privilegeBackend.shell(arrayOf("dumpsys", "input_method")).stdout)
+    } catch (e: Throwable) {
+        HeadlessLog.w(OP, "could not read input_method state", e)
+        null
     }
 
     private fun isDisplayZeroImeShowing(windowDump: String): Boolean {

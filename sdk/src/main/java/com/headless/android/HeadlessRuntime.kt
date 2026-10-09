@@ -38,7 +38,9 @@ class HeadlessRuntime internal constructor(
      */
     val maxSessions: Int = 1,
     /** Auto-switch system keyboard to the headless IME while a session is open. */
-    val autoSwitchIme: Boolean = true
+    val autoSwitchIme: Boolean = false,
+    /** Path of this app's APK; lets the runtime start the accessibility agent from it. */
+    apkPath: String? = null
 ) {
 
     companion object {
@@ -47,12 +49,17 @@ class HeadlessRuntime internal constructor(
         const val DEFAULT_DENSITY_DPI = 320
     }
 
+    val backend: PrivilegeBackend get() = privilegeBackend
     internal val stateEngine = StateEngine(privilegeBackend)
     private val janitor = DisplayJanitor(privilegeBackend)
     private val ledger = ledgerDir?.let { SessionLedger(it) }
     private val imeSwitcher = headlessImeId?.let { ImeSwitcher(privilegeBackend, ledgerDir, it) }
     private val sessions = mutableListOf<HeadlessSession>()
     private val lock = Any()
+
+    /** Shared accessibility agent (one process serves every session's display). */
+    val agent: com.headless.android.agent.UiAgent? =
+        apkPath?.let { com.headless.android.agent.UiAgent(privilegeBackend, it) }
 
     private val _events = MutableSharedFlow<SessionEvent>(
         replay = 16,
@@ -130,6 +137,7 @@ class HeadlessRuntime internal constructor(
                 displayDensityDpi = densityDpi,
                 analyzer = analyzer,
                 ledger = ledger,
+                uiAgent = agent,
                 onEvent = { _events.tryEmit(it) },
                 onClosing = { /* Display 0 isolation: do NOT restore IME while any session or app is still closing */ },
                 onClosed = { closedSession ->
@@ -176,8 +184,8 @@ class HeadlessRuntime internal constructor(
             return
         } ?: return
         try {
-            privilegeBackend.shell(arrayOf("am", "force-stop", orphan))
-            HeadlessLog.i("HeadlessRuntime", "reaped orphan session app: $orphan")
+            val reaped = com.headless.android.apps.AppLauncher(privilegeBackend).reapOrphan(orphan)
+            HeadlessLog.i("HeadlessRuntime", "orphan session app $orphan reaped=$reaped")
         } catch (e: Throwable) {
             HeadlessLog.w("HeadlessRuntime", "orphan force-stop failed for $orphan", e)
         } finally {
@@ -203,6 +211,7 @@ class HeadlessRuntime internal constructor(
             }
         }
         synchronized(lock) { sessions.clear() }
+        try { agent?.close() } catch (_: Throwable) {}
         try { imeSwitcher?.restore() } catch (_: Throwable) {}
 
         // Final leak check: if any non-default display survived our own cleanup, say so

@@ -40,6 +40,10 @@ class BinderInputInjector(
         }
     }
 
+    init {
+        require(displayId > 0) { "BinderInputInjector refuses display $displayId: display 0 is the user's physical screen" }
+    }
+
     private val inputBinder: IBinder by lazy {
         privilegeBackend.getSystemServiceBinder("input")
     }
@@ -53,9 +57,19 @@ class BinderInputInjector(
      * Returns true if injection succeeded and was dispatched.
      */
     fun inject(event: InputEvent, mode: Int = MODE_WAIT_FOR_FINISH): Boolean {
+        // Fail closed: an event whose display id was not set is delivered to display 0 —
+        // the user's physical screen. Never inject unless the target display is confirmed.
+        val setter = setDisplayIdMethod
+        if (setter == null) {
+            HeadlessLog.e(OP, "Refusing injection: InputEvent.setDisplayId unavailable, event would hit display 0")
+            return false
+        }
         try {
-            setDisplayIdMethod?.invoke(event, displayId)
-        } catch (_: Throwable) {}
+            setter.invoke(event, displayId)
+        } catch (e: Throwable) {
+            HeadlessLog.e(OP, "Refusing injection: could not set display $displayId on event", e)
+            return false
+        }
 
         val data = Parcel.obtain()
         val reply = Parcel.obtain()

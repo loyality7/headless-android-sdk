@@ -23,7 +23,7 @@ object HeadlessAutomation {
         context: Context,
         backend: PrivilegeBackend = ShizukuBackend(),
         maxSessions: Int = 1,
-        autoSwitchIme: Boolean = true
+        autoSwitchIme: Boolean = false
     ): HeadlessRuntime {
         val pkg = context.packageName
         return HeadlessRuntime(
@@ -31,7 +31,8 @@ object HeadlessAutomation {
             ledgerDir = java.io.File(context.filesDir, "headless"),
             headlessImeId = "$pkg/com.headless.android.ime.HeadlessImeService",
             maxSessions = maxSessions,
-            autoSwitchIme = autoSwitchIme
+            autoSwitchIme = autoSwitchIme,
+            apkPath = context.applicationInfo.sourceDir
         )
     }
 }

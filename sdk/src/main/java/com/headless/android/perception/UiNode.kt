@@ -22,7 +22,11 @@ data class UiNode(
     val password: Boolean = false,
     val selected: Boolean = false,
     val bounds: ElementBounds = ElementBounds(0, 0, 0, 0),
-    val children: List<UiNode> = emptyList()
+    val children: List<UiNode> = emptyList(),
+    /** Accessibility-agent node reference; empty for nodes parsed from a uiautomator XML dump. */
+    val ref: String = "",
+    val editable: Boolean = false,
+    val hint: String = ""
 ) {
     val centerX: Float get() = bounds.centerX
     val centerY: Float get() = bounds.centerY

@@ -55,6 +55,23 @@ Display #0 (activities from top to bottom):
     }
 
     @Test
+    fun `a default-display-style resumed line is never matched for a non-zero display`() {
+        // resumedPackageFromLine(line, displayId) must only try RESUMED_DEFAULT when
+        // displayId == 0. Without that restriction, a stray "ResumedActivity:" line
+        // appearing inside a secondary display's section (device/OEM quirk, or an
+        // unrelated line incidentally matching the same shape) would be accepted as
+        // that secondary display's resumed package — attributing display 0's activity
+        // to the virtual display and defeating the DisplayZeroGuard contamination check.
+        val defaultStyleLine = "  ResumedActivity: ActivityRecord{87df313 u0 com.mi.android.globallauncher/com.miui.home.launcher.Launcher t2}"
+
+        assertNull(ActivityDumpParser.resumedPackageFromLine(defaultStyleLine, 8))
+        assertEquals(
+            "com.mi.android.globallauncher",
+            ActivityDumpParser.resumedPackageFromLine(defaultStyleLine, 0)
+        )
+    }
+
+    @Test
     fun `resumed package on one display is not attributed to another`() {
         // This is the exact failure that reported com.whatsapp while Gmail was automated.
         val dump = """

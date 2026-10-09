@@ -96,7 +96,7 @@ object ActivityDumpParser {
             if (currentId == null) continue
 
             if (resumed == null) {
-                resumed = resumedPackageFromLine(rawLine)
+                resumed = resumedPackageFromLine(rawLine, currentId)
             }
             taskPackageFromLine(rawLine)?.let { tasks.add(it) }
         }
@@ -116,12 +116,14 @@ object ActivityDumpParser {
      * `topResumedActivity=` (secondary display) and `ResumedActivity:` (default display)
      * spellings. Returns null if the line is not a resumed-activity line.
      */
-    fun resumedPackageFromLine(rawLine: String): String? {
-        val record = RESUMED_SECONDARY.find(rawLine)?.value
-            ?: RESUMED_DEFAULT.find(rawLine)?.value
-            ?: return null
+    fun resumedPackageFromLine(rawLine: String, displayId: Int = 0): String? {
+        val match = if (displayId == 0) {
+            RESUMED_SECONDARY.find(rawLine) ?: RESUMED_DEFAULT.find(rawLine)
+        } else {
+            RESUMED_SECONDARY.find(rawLine)
+        } ?: return null
         // "ActivityRecord{hash u0 com.pkg/.Activity t2}" — take the component token.
-        return COMPONENT_IN_RECORD.find(record)?.groupValues?.get(1)
+        return COMPONENT_IN_RECORD.find(match.value)?.groupValues?.get(1)
     }
 
     /** Extracts a task's package from a `Task{... A=<uid>:<package> ...}` line. */
@@ -154,6 +156,28 @@ object ActivityDumpParser {
     /** True if [foregroundPackageOnDisplay] came from a resumed activity rather than a task. */
     fun foregroundPackageIsResumed(dump: String, displayId: Int): Boolean =
         parse(dump)[displayId]?.resumedPackage != null
+
+    private val ROOT_TASK_ID = Regex("""^ {2}\* Task\{[0-9a-f]+ #(\d+)\b""")
+
+    /**
+     * Root task ids on [displayId] that belong to [packageName] — what `am stack remove`
+     * takes. Only top-level (2-space) task lines count; nested child tasks are skipped.
+     */
+    fun rootTaskIdsOnDisplay(dump: String, displayId: Int, packageName: String): List<Int> {
+        val ids = mutableListOf<Int>()
+        var current: Int? = null
+        for (rawLine in dump.lineSequence()) {
+            val headerId = sectionHeaderId(rawLine)
+            if (headerId != null) {
+                current = headerId
+                continue
+            }
+            if (current != displayId) continue
+            if (taskPackageFromLine(rawLine) != packageName) continue
+            ROOT_TASK_ID.find(rawLine)?.groupValues?.get(1)?.toIntOrNull()?.let { ids.add(it) }
+        }
+        return ids
+    }
 
     /** Every display id that has a task for [packageName]. */
     fun displayIdsHosting(dump: String, packageName: String): Set<Int> =

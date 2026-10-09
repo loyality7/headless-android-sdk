@@ -18,12 +18,17 @@ data class ShellResult(
     /** Command ran and reported no failure on either channel. */
     val isSuccess: Boolean get() = exitCode == 0 && !looksLikeError
 
-    /** True if stderr carries an exception/error signature even though the exit code may be 0. */
+    /**
+     * True if the output carries an error signature even though the exit code may be 0.
+     * `uiautomator dump` prints "ERROR: could not get idle state." on stdout and exits 0,
+     * so a column-0 `ERROR:` line on stdout counts too.
+     */
     val looksLikeError: Boolean
         get() = stderr.contains("Exception") ||
             stderr.contains("Error:") ||
             stderr.contains("error:") ||
-            stderr.contains("Failure")
+            stderr.contains("Failure") ||
+            stdout.lineSequence().any { it.startsWith("ERROR:") }
 
     /** Short single-line summary suitable for failure evidence. */
     fun summary(): String {
@@ -124,4 +129,16 @@ interface PrivilegeBackend {
 
     /** Unregisters a callback. */
     fun removeOnDeadListener(listener: () -> Unit) {}
+
+    /**
+     * Starts a long-lived privileged process whose stdin/stdout stay open, or null if this
+     * backend cannot. Unlike [shell] it does not wait for the process to exit.
+     */
+    fun spawn(command: Array<String>): Process? = null
+
+    /** Obtains the privileged IAgentUserService if connected. */
+    fun getAgentUserService(): IAgentUserService? = null
+
+    /** Binds the privileged IAgentUserService running under shell UID. */
+    fun bindAgentUserService(packageName: String): IAgentUserService? = null
 }

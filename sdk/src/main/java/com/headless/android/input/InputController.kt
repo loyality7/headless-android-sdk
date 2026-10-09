@@ -15,6 +15,10 @@ class InputController(
     private val isolationGuard: DisplayIsolationGuard? = null,
     private val directInjector: BinderInputInjector? = BinderInputInjector(privilegeBackend, displayId)
 ) {
+    init {
+        require(displayId > 0) { "InputController refuses display $displayId: display 0 is the user's physical screen" }
+    }
+
     companion object {
         private const val OP = "InputController"
         private const val KEYCODE_ENTER = 66

@@ -44,6 +44,8 @@ class CommandExecutor(
 
     val checkpointStore = SessionCheckpointStore(outputDir)
     private var session: HeadlessSession? = null
+    val currentSession: HeadlessSession?
+        get() = synchronized(execLock) { session }
     private var lastFrame: Screenshot? = null
     private var frameCounter = 0
 

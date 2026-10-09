@@ -10,7 +10,14 @@ data class CompactUiElement(
     val resourceId: String?,
     val bounds: ElementBounds,
     val clickable: Boolean,
-    val editable: Boolean
+    val editable: Boolean,
+    /** Accessibility-agent reference used to act on this exact element; empty without the agent. */
+    val ref: String = "",
+    val scrollable: Boolean = false,
+    val checked: Boolean = false,
+    val enabled: Boolean = true,
+    val focused: Boolean = false,
+    val hint: String? = null
 ) {
     val centerX: Float get() = bounds.centerX
     val centerY: Float get() = bounds.centerY
@@ -25,13 +32,20 @@ data class CompactUiElement(
             !text.isNullOrBlank() -> "\"$text\""
             else -> ""
         }
-        val flags = when {
+        val kind = when {
             editable -> "(EditText)"
+            scrollable -> "(Scrollable)"
             clickable -> "(Clickable)"
             else -> "($type)"
         }
+        val state = buildString {
+            if (checked) append(" checked")
+            if (!enabled) append(" disabled")
+            if (focused) append(" focused")
+        }
+        val hintPart = if (editable && text.isNullOrBlank() && !hint.isNullOrBlank()) "hint=\"$hint\"" else ""
         val center = "[x=${centerX.toInt()}, y=${centerY.toInt()}]"
-        return "[$index] $idLabel$flags $content $center".replace("  ", " ").trim()
+        return "[$index] $idLabel$kind$state $content $hintPart $center".replace(Regex(" {2,}"), " ").trim()
     }
 }
 
@@ -97,7 +111,13 @@ object UiTreeCompressor {
                 resourceId = candidate.node.resourceId.ifBlank { null },
                 bounds = candidate.node.bounds,
                 clickable = candidate.node.clickable || candidate.node.checkable,
-                editable = candidate.node.className.endsWith("EditText", ignoreCase = true)
+                editable = candidate.node.editable || candidate.node.className.endsWith("EditText", ignoreCase = true),
+                ref = candidate.node.ref,
+                scrollable = candidate.node.scrollable,
+                checked = candidate.node.checked,
+                enabled = candidate.node.enabled,
+                focused = candidate.node.focused,
+                hint = candidate.node.hint.ifBlank { null }
             )
         }
 
@@ -114,7 +134,7 @@ object UiTreeCompressor {
 
     private fun collectCandidates(node: UiNode, acc: MutableList<RawCandidate>) {
         val visibleText = node.text.ifBlank { node.contentDesc }.trim()
-        val isInteractive = node.clickable || node.checkable || node.nodeTypeIsInteractive()
+        val isInteractive = node.clickable || node.checkable || node.scrollable || node.editable || node.nodeTypeIsInteractive()
         val hasBounds = node.bounds.width > 0 && node.bounds.height > 0
 
         if (hasBounds && (visibleText.isNotEmpty() || isInteractive)) {

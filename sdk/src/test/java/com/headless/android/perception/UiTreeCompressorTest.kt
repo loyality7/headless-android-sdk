@@ -29,7 +29,8 @@ class UiTreeCompressorTest {
         val snapshot = UiTreeCompressor.compress(root)
 
         assertEquals("com.android.chrome", snapshot.packageName)
-        assertEquals(4, snapshot.elements.size)
+        // 5: the scrollable WebView container is listed so an agent can scroll it.
+        assertEquals(5, snapshot.elements.size)
 
         // Element 1: URL bar
         val el1 = snapshot.findByIndex(1)
@@ -43,8 +44,9 @@ class UiTreeCompressorTest {
         val prompt = snapshot.toPromptText()
         assertTrue(prompt.contains("[1] url_bar (EditText) \"google.com\" [x=480, y=60]"))
         assertTrue(prompt.contains("[2] tab_button (Clickable) \"Open tabs\" [x=870, y=60]"))
-        assertTrue(prompt.contains("[3] tsf (Clickable) \"Search with Google\" [x=400, y=550]"))
-        assertTrue(prompt.contains("[4] (TextView) \"Trending topics\" [x=220, y=675]"))
+        assertTrue(prompt.contains("[3] content_view (Scrollable) focused [x=540, y=1020]"))
+        assertTrue(prompt.contains("[4] tsf (Clickable) \"Search with Google\" [x=400, y=550]"))
+        assertTrue(prompt.contains("[5] (TextView) \"Trending topics\" [x=220, y=675]"))
 
         // Check JSON output
         val json = snapshot.toJson()

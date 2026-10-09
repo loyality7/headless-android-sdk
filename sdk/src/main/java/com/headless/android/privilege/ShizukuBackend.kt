@@ -223,6 +223,8 @@ class ShizukuBackend : PrivilegeBackend {
         return ShellResult(exitCode = exit, stdout = stdout, stderr = stderr)
     }
 
+    override fun spawn(command: Array<String>): Process? = startProcess(command)
+
     private fun startProcess(command: Array<String>): Process {
         if (!isAuthorized()) {
             val h = health()
@@ -240,8 +242,65 @@ class ShizukuBackend : PrivilegeBackend {
         return newProcess.invoke(null, command, null, null) as Process
     }
 
+    @Volatile
+    private var agentUserService: IAgentUserService? = null
+    private val agentUserLock = Any()
+
+    private val agentUserConnection = object : android.content.ServiceConnection {
+        override fun onServiceConnected(name: android.content.ComponentName?, service: IBinder?) {
+            HeadlessLog.i(OP, "IAgentUserService connected: $name")
+            agentUserService = IAgentUserService.Stub.asInterface(service)
+        }
+
+        override fun onServiceDisconnected(name: android.content.ComponentName?) {
+            HeadlessLog.w(OP, "IAgentUserService disconnected: $name")
+            agentUserService = null
+        }
+    }
+
+    override fun bindAgentUserService(packageName: String): IAgentUserService? = synchronized(agentUserLock) {
+        agentUserService?.let { return it }
+        val auth = isAuthorized()
+        val avail = isAvailable()
+        android.util.Log.i("ShizukuBackend", "bindAgentUserService: avail=$avail auth=$auth pkg=$packageName")
+        if (!auth) {
+            android.util.Log.w("ShizukuBackend", "bindAgentUserService: not authorized")
+            return null
+        }
+
+        try {
+            val component = android.content.ComponentName(packageName, AgentUserService::class.java.name)
+            val args = Shizuku.UserServiceArgs(component)
+                .daemon(false)
+                .processNameSuffix("ui")
+                .debuggable(true)
+                .version(1)
+
+            android.util.Log.i("ShizukuBackend", "Calling Shizuku.bindUserService with component $component")
+            Shizuku.bindUserService(args, agentUserConnection)
+
+            val deadline = System.currentTimeMillis() + 5000L
+            while (System.currentTimeMillis() < deadline) {
+                agentUserService?.let {
+                    android.util.Log.i("ShizukuBackend", "bindAgentUserService succeeded!")
+                    return it
+                }
+                Thread.sleep(150)
+            }
+            android.util.Log.w("ShizukuBackend", "bindAgentUserService timed out waiting for connection")
+        } catch (e: Throwable) {
+            android.util.Log.e("ShizukuBackend", "Failed to bind AgentUserService", e)
+        }
+        return agentUserService
+    }
+
+    override fun getAgentUserService(): IAgentUserService? = agentUserService
+
     override fun close() {
         try {
+            agentUserService?.let {
+                try { it.destroy() } catch (_: Throwable) {}
+            }
             Shizuku.removeBinderReceivedListener(binderReceivedListener)
             Shizuku.removeBinderDeadListener(binderDeadListener)
         } catch (_: Throwable) {}

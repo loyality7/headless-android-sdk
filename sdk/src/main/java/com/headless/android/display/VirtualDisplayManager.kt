@@ -52,7 +52,7 @@ class VirtualDisplayManager(private val privilegeBackend: PrivilegeBackend) {
         try {
             val displayBinder = privilegeBackend.getSystemServiceBinder("display")
 
-            val flags = FLAG_TRUSTED or FLAG_OWN_CONTENT_ONLY or FLAG_SUPPORTS_TOUCH or FLAG_ALWAYS_UNLOCKED
+            val flags = FLAG_PUBLIC or FLAG_TRUSTED or FLAG_OWN_CONTENT_ONLY or FLAG_SUPPORTS_TOUCH or FLAG_ALWAYS_UNLOCKED
             HeadlessLog.i(OP, "VirtualDisplay REQUESTED: name=$name width=$width height=$height densityDpi=$densityDpi flags=0x${Integer.toHexString(flags)}")
             val config = VirtualDisplayConfig.Builder(name, width, height, densityDpi)
                 .setFlags(flags)

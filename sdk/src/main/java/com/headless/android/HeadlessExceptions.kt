@@ -47,3 +47,7 @@ class TargetStalenessException(
     message: String = "Target '$targetDescription' is stale (age=${ageMs}ms > max=${maxAgeMs}ms). Screen layout may have shifted."
 ) : HeadlessException(message)
 
+
+/** The accessibility agent process failed to start, died, timed out, or refused a request. */
+class AccessibilityAgentException(message: String, cause: Throwable? = null) :
+    HeadlessException(message, cause)
