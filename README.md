@@ -99,6 +99,11 @@ rules, and the refusal paths.
   ("process is bad"). Opening the app normally or waiting clears it.
 - The Shizuku UserService route (`AgentUserService`) does not start on the test device, so
   the SDK does not depend on it.
+- Screen-off is not verified with the accessibility agent. Earlier testing found the hidden
+  display stops producing frames while the phone's screen is off (screenshots fail; placement
+  and input still worked). Whether the agent can still read the element tree then has not been
+  tested, and a long run may be slowed or killed by battery limits.
+- Screenshots under the "no keyboard" display setting have not been re-verified.
 - If the app process dies, the app is briefly moved to display 0 before the watchdog removes it.
 - Other devices and OEMs are untested.
 
