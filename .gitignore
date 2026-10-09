@@ -16,3 +16,6 @@ local.properties
 *.jpeg
 frames/
 demo_log.txt
+
+# local-only benchmark app
+benchmark/

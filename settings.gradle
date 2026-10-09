@@ -16,3 +16,8 @@ dependencyResolutionManagement {
 rootProject.name = "HeadlessAndroidRuntime"
 include ':sdk'
 include ':example'
+
+// Optional local-only module, kept out of git; included only when the folder exists.
+if (file('benchmark').exists()) {
+    include ':benchmark'
+}
