@@ -127,9 +127,47 @@ class ControlService : Service() {
                     writeLine(report)
                     return@launch
                 }
+                if (cmdName.equals("test_ui_service", ignoreCase = true)) {
+                    val exec = ensureExecutor()
+                    val rt = Hub.runtime ?: throw IllegalStateException("Runtime not initialized")
+                    val uiService = rt.backend.bindAgentUserService(packageName)
+                    if (uiService == null) {
+                        writeLine("""{"outcome":"FAILED","test":"ui_service","reason":"bindAgentUserService returned null"}""")
+                        return@launch
+                    }
+                    val report = uiService.displayReport
+                    writeLine("""{"outcome":"VERIFIED","test":"ui_service","report":$report}""")
+                    return@launch
+                }
                 if (cmdName.equals("test_ui_tree", ignoreCase = true)) {
                     val report = runUiTreeAudit()
                     writeLine(report)
+                    return@launch
+                }
+                if (cmdName.equals("ui", ignoreCase = true) || cmdName.equals("dump_ui", ignoreCase = true)) {
+                    val exec = ensureExecutor()
+                    val s = exec.currentSession ?: throw IllegalStateException("No open session")
+                    val prompt = s.uiPrompt()
+                    val uiFile = File(outputDir, "ui.txt")
+                    uiFile.writeText(prompt)
+                    writeLine("""{"cmd":"ui","count":${prompt.lines().size},"file":"${esc(uiFile.absolutePath)}"}""")
+                    return@launch
+                }
+                if (cmdName.equals("click", ignoreCase = true) && intent.hasExtra("index")) {
+                    val index = intent.getIntExtra("index", 1)
+                    val exec = ensureExecutor()
+                    val s = exec.currentSession ?: throw IllegalStateException("No open session")
+                    s.click(index)
+                    writeLine("""{"cmd":"click","index":$index,"outcome":"VERIFIED"}""")
+                    return@launch
+                }
+                if (cmdName.equals("enter_text", ignoreCase = true)) {
+                    val index = intent.getIntExtra("index", 1)
+                    val text = intent.getStringExtra("text") ?: ""
+                    val exec = ensureExecutor()
+                    val s = exec.currentSession ?: throw IllegalStateException("No open session")
+                    s.enterText(index, text)
+                    writeLine("""{"cmd":"enter_text","index":$index,"text":"${esc(text)}","outcome":"VERIFIED"}""")
                     return@launch
                 }
                 val command = parse(cmdName, intent)
